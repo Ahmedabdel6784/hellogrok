@@ -1,0 +1,460 @@
+package config
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/hellowind777/hellogrok/internal/cfgpatch"
+	"github.com/pelletier/go-toml/v2"
+)
+
+// Model is one [model.*] entry from Grok config.toml.
+type Model struct {
+	ID                    string
+	Model                 string
+	Name                  string
+	BaseURL               string
+	APIBaseURL            string
+	APIBackend            string
+	SupportsBackendSearch bool
+	AuthScheme            string
+	IncomingAuthScheme    string
+	APIKey                string
+	EnvKey                string // single name or first of array (resolved later)
+	EnvKeys               []string
+	AuthProvider          string
+	DynamicAuth           bool
+	ExtraHeaders          map[string]string
+	EnvHTTPHeaders        map[string]string
+}
+
+// authProviderConfig mirrors the fields Grok Build accepts in
+// [auth_provider.*] and [model_providers.*.auth]. Keeping this typed prevents
+// a malformed helper declaration from being mistaken for usable dynamic auth.
+type authProviderConfig struct {
+	Command      string   `toml:"command"`
+	Args         []string `toml:"args"`
+	TokenTTLSecs *uint64  `toml:"token_ttl_secs"`
+	TimeoutSecs  *uint64  `toml:"timeout_secs"`
+	CWD          *string  `toml:"cwd"`
+}
+
+// Route is a local-routing target derived from a model base_url.
+type Route struct {
+	ChannelID  string
+	Host       string // e.g. congee.pro
+	OriginBase string // effective upstream base_url before proxy rewriting
+	APIBackend string // original upstream backend
+	WireModel  string // model value sent to the upstream
+	APIKey     string // resolved channel credential
+	AuthScheme string // upstream bearer | x_api_key
+	// IncomingAuthScheme is the scheme Grok Build uses on the local facade.
+	// Unlike the upstream default for Messages, Build defaults every backend to
+	// bearer unless auth_scheme is explicitly configured.
+	IncomingAuthScheme string
+	DynamicAuth        bool // an explicit auth_provider owns the incoming auth token
+	// ExtraHeaders are channel-owned values from extra_headers and resolved
+	// env_http_headers. They are safe to reapply after discarding session auth.
+	ExtraHeaders map[string]string
+	// SupportsBackendSearch controls whether the facade may add a hosted search
+	// declaration for this channel. False keeps Build's client web_search path
+	// intact for an explicit search model or Build's authenticated default.
+	SupportsBackendSearch bool
+}
+
+// GrokHome returns ~/.grok (or GROK_HOME).
+func GrokHome() string {
+	if v := os.Getenv("GROK_HOME"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".grok")
+}
+
+// ConfigPath is ~/.grok/config.toml
+func ConfigPath() string {
+	return filepath.Join(GrokHome(), "config.toml")
+}
+
+// LoadModels parses [model.*] tables. Never writes the file.
+func LoadModels(path string) ([]Model, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var root map[string]any
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("parse toml: %w", err)
+	}
+	modelTable, _ := root["model"].(map[string]any)
+	if modelTable == nil {
+		return nil, nil
+	}
+	providerTable, _ := root["model_providers"].(map[string]any)
+	authProviderTable, _ := root["auth_provider"].(map[string]any)
+	usableAuthProviders := make(map[string]bool, len(authProviderTable))
+	for name, rawProvider := range authProviderTable {
+		usableAuthProviders[name] = usableAuthProvider(rawProvider)
+	}
+	globalHeaders := map[string]string{}
+	if models, _ := root["models"].(map[string]any); models != nil {
+		globalHeaders = stringMap(models["extra_headers"])
+	}
+	ids := make([]string, 0, len(modelTable))
+	for id := range modelTable {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var out []Model
+	for _, id := range ids {
+		v := modelTable[id]
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		providerID := strings.TrimSpace(str(m["model_provider"]))
+		provider, _ := providerTable[providerID].(map[string]any)
+
+		baseURL := inheritedString(m, provider, "base_url")
+		apiBaseURL := inheritedString(m, provider, "api_base_url")
+		apiBackend := strings.ToLower(inheritedString(m, provider, "api_backend"))
+		supportsBackendSearch, err := inheritedBool(m, provider, "supports_backend_search")
+		if err != nil {
+			return nil, fmt.Errorf("[model.%s].supports_backend_search %w", id, err)
+		}
+
+		modelEnvKeys := envKeyList(m["env_key"])
+		modelAPIKey := strings.TrimSpace(str(m["api_key"]))
+		modelAuthProvider, modelHasStringAuthProvider := stringField(m, "auth_provider")
+		_, modelHasAuthProvider := m["auth_provider"]
+		modelOwnsAuth := modelAPIKey != "" || len(modelEnvKeys) > 0 || modelHasAuthProvider
+		apiKey := modelAPIKey
+		envKeys := modelEnvKeys
+		authProvider := strings.TrimSpace(modelAuthProvider)
+		dynamicAuth := modelHasStringAuthProvider && usableAuthProviders[authProvider]
+		if !modelOwnsAuth && provider != nil {
+			apiKey = strings.TrimSpace(str(provider["api_key"]))
+			envKeys = envKeyList(provider["env_key"])
+			providerAuthProvider, providerHasStringAuthProvider := stringField(provider, "auth_provider")
+			_, providerHasAuthProvider := provider["auth_provider"]
+			if providerHasAuthProvider {
+				authProvider = strings.TrimSpace(providerAuthProvider)
+				dynamicAuth = providerHasStringAuthProvider && usableAuthProviders[authProvider]
+			} else if inlineAuth, ok := provider["auth"]; ok {
+				authProvider = "model_provider:" + providerID
+				dynamicAuth = usableAuthProvider(inlineAuth)
+			} else {
+				authProvider = ""
+				dynamicAuth = false
+			}
+		}
+
+		modelHeaders := stringMap(m["extra_headers"])
+		if len(modelHeaders) == 0 {
+			modelHeaders = stringMap(provider["extra_headers"])
+		}
+		extraHeaders := cloneStringMap(globalHeaders)
+		for key, value := range modelHeaders {
+			setStringMapCaseInsensitive(extraHeaders, key, value)
+		}
+		envHTTPHeaders := stringMap(m["env_http_headers"])
+		if len(envHTTPHeaders) == 0 {
+			envHTTPHeaders = stringMap(provider["env_http_headers"])
+		}
+		modelAuthScheme := normalizeAuthScheme(inheritedString(m, nil, "auth_scheme"))
+		upstreamAuthScheme := modelAuthScheme
+		if upstreamAuthScheme == "" {
+			upstreamAuthScheme = normalizeAuthScheme(inheritedString(nil, provider, "auth_scheme"))
+		}
+		out = append(out, Model{
+			ID:                    id,
+			Model:                 str(m["model"]),
+			Name:                  str(m["name"]),
+			BaseURL:               baseURL,
+			APIBaseURL:            apiBaseURL,
+			APIBackend:            apiBackend,
+			SupportsBackendSearch: supportsBackendSearch,
+			AuthScheme:            upstreamAuthScheme,
+			IncomingAuthScheme:    modelAuthScheme,
+			APIKey:                apiKey,
+			EnvKeys:               envKeys,
+			EnvKey:                first(envKeys),
+			AuthProvider:          authProvider,
+			DynamicAuth:           dynamicAuth,
+			ExtraHeaders:          extraHeaders,
+			EnvHTTPHeaders:        envHTTPHeaders,
+		})
+	}
+	return out, nil
+}
+
+func usableAuthProvider(raw any) bool {
+	encoded, err := toml.Marshal(raw)
+	if err != nil {
+		return false
+	}
+	var provider authProviderConfig
+	if err := toml.Unmarshal(encoded, &provider); err != nil {
+		return false
+	}
+	return strings.TrimSpace(provider.Command) != ""
+}
+
+func inheritedString(model, provider map[string]any, key string) string {
+	if value, ok := stringField(model, key); ok {
+		return strings.TrimSpace(value)
+	}
+	if value, ok := stringField(provider, key); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func inheritedBool(model, provider map[string]any, key string) (bool, error) {
+	for _, values := range []map[string]any{model, provider} {
+		if values == nil {
+			continue
+		}
+		raw, exists := values[key]
+		if !exists {
+			continue
+		}
+		value, ok := raw.(bool)
+		if !ok {
+			return false, fmt.Errorf("must be a boolean")
+		}
+		return value, nil
+	}
+	return false, nil
+}
+
+func stringField(values map[string]any, key string) (string, bool) {
+	if values == nil {
+		return "", false
+	}
+	value, ok := values[key]
+	if !ok {
+		return "", false
+	}
+	text, ok := value.(string)
+	return text, ok
+}
+
+func stringMap(v any) map[string]string {
+	out := map[string]string{}
+	switch values := v.(type) {
+	case map[string]any:
+		for key, raw := range values {
+			if value, ok := raw.(string); ok {
+				out[key] = value
+			}
+		}
+	case map[string]string:
+		for key, value := range values {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func setStringMapCaseInsensitive(values map[string]string, key, value string) {
+	for existing := range values {
+		if strings.EqualFold(existing, key) {
+			delete(values, existing)
+			break
+		}
+	}
+	values[key] = value
+}
+
+func normalizeAuthScheme(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch strings.ReplaceAll(value, "-", "_") {
+	case "x_api_key", "xapikey":
+		return "x_api_key"
+	case "bearer":
+		return "bearer"
+	default:
+		return ""
+	}
+}
+
+func envKeyList(v any) []string {
+	switch t := v.(type) {
+	case string:
+		t = strings.TrimSpace(t)
+		if t == "" {
+			return nil
+		}
+		return []string{t}
+	case []any:
+		var out []string
+		for _, el := range t {
+			if s := strings.TrimSpace(str(el)); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func first(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	return ss[0]
+}
+
+func str(v any) string {
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// ResolveAPIKey implements Grok credential order for static config fields:
+// api_key > env_key (first non-empty env) — OAuth / XAI_API_KEY are session-level and
+// handled by Grok itself; hellogrok only injects when a channel key exists.
+func ResolveAPIKey(m Model) string {
+	if k := strings.TrimSpace(m.APIKey); k != "" {
+		return k
+	}
+	for _, name := range m.EnvKeys {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func resolveExtraHeaders(m Model) map[string]string {
+	headers := cloneStringMap(m.ExtraHeaders)
+	for header, envName := range m.EnvHTTPHeaders {
+		if value := strings.TrimSpace(os.Getenv(strings.TrimSpace(envName))); value != "" {
+			setStringMapCaseInsensitive(headers, header, value)
+		}
+	}
+	return headers
+}
+
+// EffectiveOriginBase returns a direct upstream URL. Per-channel proxy URLs do
+// not encode their origin; the running process keeps that origin in memory and
+// crash recovery keeps it in the rewrite state file.
+func EffectiveOriginBase(baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return ""
+	}
+	if cfgpatch.IsProxyURL(baseURL) {
+		return ""
+	}
+	return baseURL
+}
+
+// BuildRoutes groups models by upstream host for local routing.
+// Config files are never modified here; routes are computed in memory only.
+// Already-proxied values are skipped because their origin is intentionally not
+// encoded in the public local URL.
+func BuildRoutes(models []Model) ([]Route, error) {
+	var out []Route
+	for _, m := range models {
+		key := ResolveAPIKey(m)
+		origin := m.BaseURL
+		// Grok Build uses base_url for a model-owned api_key/env_key, an
+		// auth-provider token, and a login session. api_base_url is only its
+		// global XAI_API_KEY fallback. hellogrok intentionally does not treat
+		// that global fallback as a credential for an arbitrary custom channel,
+		// so channel-owned requests must retain the original base_url.
+		if origin == "" {
+			origin = m.APIBaseURL
+		}
+		origin = EffectiveOriginBase(origin)
+		if origin == "" {
+			continue
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return nil, fmt.Errorf("model %q has an invalid custom base URL", m.ID)
+		}
+		scheme := strings.ToLower(u.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return nil, fmt.Errorf("model %q uses unsupported URL scheme %q", m.ID, scheme)
+		}
+		if u.User != nil {
+			return nil, fmt.Errorf("model %q custom base URL must not contain user info", m.ID)
+		}
+		if u.Fragment != "" {
+			return nil, fmt.Errorf("model %q custom base URL must not contain a fragment", m.ID)
+		}
+		host := u.Hostname()
+		if host == "" {
+			return nil, fmt.Errorf("model %q custom base URL has no host", m.ID)
+		}
+		// Never route the local compat proxy into itself as an "upstream host".
+		ip := net.ParseIP(host)
+		loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+		if loopback && u.Port() == "18787" {
+			continue
+		}
+		displayHost := host
+		if u.Port() != "" && u.Port() != "80" && u.Port() != "443" {
+			displayHost = net.JoinHostPort(host, u.Port())
+		}
+		backend := strings.TrimSpace(strings.ToLower(m.APIBackend))
+		if backend == "" {
+			backend = "chat_completions"
+		}
+		if backend != "responses" && backend != "messages" && backend != "chat_completions" {
+			return nil, fmt.Errorf("model %q uses unsupported api_backend %q", m.ID, backend)
+		}
+		wireModel := strings.TrimSpace(m.Model)
+		if wireModel == "" {
+			wireModel = m.ID
+		}
+		incomingAuthScheme := m.IncomingAuthScheme
+		if incomingAuthScheme == "" {
+			incomingAuthScheme = "bearer"
+		}
+		authScheme := m.AuthScheme
+		if authScheme == "" {
+			if backend == "messages" {
+				authScheme = "x_api_key"
+			} else {
+				authScheme = "bearer"
+			}
+		}
+		out = append(out, Route{
+			ChannelID:             m.ID,
+			Host:                  displayHost,
+			OriginBase:            origin,
+			APIBackend:            backend,
+			WireModel:             wireModel,
+			APIKey:                key,
+			AuthScheme:            authScheme,
+			IncomingAuthScheme:    incomingAuthScheme,
+			DynamicAuth:           m.DynamicAuth && key == "",
+			ExtraHeaders:          resolveExtraHeaders(m),
+			SupportsBackendSearch: m.SupportsBackendSearch,
+		})
+	}
+	return out, nil
+}

@@ -1,0 +1,14 @@
+dist/
+*.exe
+*.test
+/hellogrok
+/hellogrok-tray
+/coverage
+/coverage.*
+/.tmp-*
+.DS_Store
+.idea/
+.vscode/
+*.log
+# local only — committed syso under cmd/hellogrok are OK for PE icons
+# *.syso
