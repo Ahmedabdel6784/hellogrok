@@ -10,6 +10,16 @@ func TestClientSearchWireAliasAvoidsCollisionsAndLeavesHostedToolsUntouched(t *t
 			map[string]any{"type": "web_search", "name": "web_search"},
 		},
 		"tool_choice": map[string]any{"type": "function", "name": "web_search"},
+		"output": []any{map[string]any{
+			"type": "message",
+			"content": []any{map[string]any{
+				"type": "output_text",
+				"text": "I used " + clientWebSearchWireAliasBase + "_2 to search.",
+			}, map[string]any{
+				"type": "output_text",
+				"text": "Do not rewrite " + clientWebSearchWireAliasBase + "_20 because it is a different identifier.",
+			}},
+		}},
 	}
 	alias := chooseClientWebSearchWireAlias(root)
 	if alias != clientWebSearchWireAliasBase+"_2" {
@@ -31,5 +41,14 @@ func TestClientSearchWireAliasAvoidsCollisionsAndLeavesHostedToolsUntouched(t *t
 	if !restoreClientWebSearchAlias(root, alias) || stringValue(client["name"]) != "web_search" ||
 		stringValue(choice["name"]) != "web_search" {
 		t.Fatalf("client alias was not restored: %#v", root)
+	}
+	output := anySlice(root["output"])[0].(map[string]any)
+	content := anySlice(output["content"])[0].(map[string]any)
+	if got := stringValue(content["text"]); got != "I used web_search to search." {
+		t.Fatalf("client alias leaked in user-visible text: %q", got)
+	}
+	longerIdentifier := anySlice(output["content"])[1].(map[string]any)
+	if got := stringValue(longerIdentifier["text"]); got != "Do not rewrite "+clientWebSearchWireAliasBase+"_20 because it is a different identifier." {
+		t.Fatalf("longer identifier was corrupted: %q", got)
 	}
 }

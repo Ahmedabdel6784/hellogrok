@@ -209,7 +209,7 @@ Build 会在临时 base 后追加 `/responses`。hellogrok 根据渠道原始 `a
 
 独立实现的 grok2api 也证实了这个不直观的 Grok CLI 路由规则：对具备稳定缓存会话的 Build 请求，它会在已有 `web_search` 时[补入 `x_search`](https://github.com/chenyme/grok2api/blob/56cfd210ce33169997b709ec7529b90c708f919b/backend/internal/infra/provider/cli/responses_cache_route.go#L45-L73)，并明确说明这是官方 Build 行为要求的路由项。这不表示 X Search 是 Web Search 的别名，而是 Grok Build 上游在这条路由上需要同时看到二者。因此 hellogrok 只对 Grok Responses 路由保留一对工具。
 
-部分 Grok 中转会把普通函数名 `web_search` 截获成自己的 hosted search，即使渠道按客户端搜索配置，也不会返回 Build 所需的函数调用。对于 `supports_backend_search = false`/缺省路由，hellogrok 因此只在上游线缆上把这个普通函数临时改名为无冲突的 `hellogrok_client_web_search`（若用户已有同名工具则自动加数字后缀），并同步改写工具选择和历史函数调用；上游响应返回后再映射回 `web_search`。Build、界面、会话历史和搜索模型始终只看到原生名称，hosted `web_search`/`x_search` 声明也不会被改名。
+部分 Grok 中转会把普通函数名 `web_search` 截获成自己的 hosted search，即使渠道按客户端搜索配置，也不会返回 Build 所需的函数调用。对于 `supports_backend_search = false`/缺省路由，hellogrok 因此只在上游线缆上把这个普通函数临时改名为无冲突的 `hellogrok_web_search`（若用户已有同名工具则自动加数字后缀），并同步改写工具选择和历史函数调用；上游响应返回后再映射回 `web_search`。Build、界面、会话历史和搜索模型始终只看到原生名称，hosted `web_search`/`x_search` 声明也不会被改名。
 
 hellogrok 不会把中转 URL 替换成 grok2api 使用的私有上游。grok2api 访问 `https://cli-chat-proxy.grok.com/v1` 时使用 [Build OAuth 及 CLI 专用鉴权与会话头](https://github.com/chenyme/grok2api/blob/56cfd210ce33169997b709ec7529b90c708f919b/backend/internal/infra/provider/cli/adapter.go#L803-L854)；Console 路由还要求 SSO、DPoP 逐请求签名、浏览器状态和 `x-cluster`。中转公开 API key 不属于其中任何一种凭据，只改 URL 会把有效的中转请求变成未鉴权的上游请求。
 

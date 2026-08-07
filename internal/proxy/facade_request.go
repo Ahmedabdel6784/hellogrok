@@ -155,7 +155,7 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 	}
 }
 
-const clientWebSearchDescription = "Search the public web for information, sources, current facts, or URLs. Use this tool whenever the user asks to search, browse, look up, verify, or obtain up-to-date information. This invokes Grok Build's configured client web-search model. Do not use web_fetch as a substitute for web search."
+const clientWebSearchDescription = "Search the public web for information, sources, current facts, or URLs. Use this tool whenever the user asks to search, browse, look up, verify, or obtain up-to-date information. This invokes Grok Build's configured client web-search model. In all user-visible text, refer to this tool only as web_search and never mention its internal wire name. Do not use web_fetch as a substitute for web search."
 
 const clientWebFetchDescription = "Fetch and read one specific URL that is already known. Do not use this tool to search, discover URLs, or fetch a search-engine results page; use web_search first for those tasks."
 

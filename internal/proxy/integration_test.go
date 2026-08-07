@@ -455,11 +455,11 @@ func TestClientSearchWireAliasRoundTripsEveryUpstreamProtocol(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				switch backend {
 				case "responses":
-					_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"grok-real","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"hellogrok_client_web_search","arguments":"{\"query\":\"q\"}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+					_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"grok-real","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"hellogrok_web_search","arguments":"{\"query\":\"q\"}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
 				case "messages":
-					_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"hellogrok_client_web_search","input":{"query":"q"}}],"model":"grok-real","stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`)
+					_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"hellogrok_web_search","input":{"query":"q"}}],"model":"grok-real","stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`)
 				case "chat_completions":
-					_, _ = io.WriteString(w, `{"id":"chat_1","object":"chat.completion","created":1,"model":"grok-real","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"hellogrok_client_web_search","arguments":"{\"query\":\"q\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+					_, _ = io.WriteString(w, `{"id":"chat_1","object":"chat.completion","created":1,"model":"grok-real","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"hellogrok_web_search","arguments":"{\"query\":\"q\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
 				}
 			}))
 			defer up.Close()

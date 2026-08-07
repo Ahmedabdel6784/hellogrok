@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const clientWebSearchWireAliasBase = "hellogrok_client_web_search"
+const clientWebSearchWireAliasBase = "hellogrok_web_search"
 
 // chooseClientWebSearchWireAlias keeps Build's public web_search name away
 // from upstreams that reserve or intercept that name as a hosted tool.
@@ -91,17 +91,67 @@ func restoreClientWebSearchAlias(value any, alias string) bool {
 				typed["name"] = "web_search"
 				changed = true
 			}
-			for _, child := range typed {
+			for key, child := range typed {
+				if text, ok := child.(string); ok {
+					if restored, restoredText := replaceIdentifier(text, alias, "web_search"); restoredText {
+						typed[key] = restored
+						changed = true
+					}
+					continue
+				}
 				walk(child)
 			}
 		case []any:
-			for _, child := range typed {
+			for index, child := range typed {
+				if text, ok := child.(string); ok {
+					if restored, restoredText := replaceIdentifier(text, alias, "web_search"); restoredText {
+						typed[index] = restored
+						changed = true
+					}
+					continue
+				}
 				walk(child)
 			}
 		}
 	}
 	walk(value)
 	return changed
+}
+
+func replaceIdentifier(value, old, replacement string) (string, bool) {
+	searchFrom := 0
+	writtenThrough := 0
+	changed := false
+	var restored strings.Builder
+	for searchFrom < len(value) {
+		relative := strings.Index(value[searchFrom:], old)
+		if relative < 0 {
+			break
+		}
+		start := searchFrom + relative
+		end := start + len(old)
+		if (start > 0 && identifierByte(value[start-1])) || (end < len(value) && identifierByte(value[end])) {
+			searchFrom = end
+			continue
+		}
+		if !changed {
+			restored.Grow(len(value))
+		}
+		restored.WriteString(value[writtenThrough:start])
+		restored.WriteString(replacement)
+		writtenThrough = end
+		searchFrom = end
+		changed = true
+	}
+	if !changed {
+		return value, false
+	}
+	restored.WriteString(value[writtenThrough:])
+	return restored.String(), true
+}
+
+func identifierByte(value byte) bool {
+	return value == '_' || value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
 }
 
 func restoreClientWebSearchAliasJSON(data []byte, alias string) ([]byte, error) {

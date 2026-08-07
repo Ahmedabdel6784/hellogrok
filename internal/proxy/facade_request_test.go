@@ -157,6 +157,7 @@ func TestFacadeForcesClientSearchForExplicitUserIntentOnEveryProtocol(t *testing
 				}
 			}
 			if !strings.Contains(string(request.Body), "configured client web-search model") ||
+				!strings.Contains(string(request.Body), "refer to this tool only as web_search") ||
 				!strings.Contains(string(request.Body), "Do not use this tool to search") ||
 				!strings.Contains(string(request.Body), "web_fetch") {
 				t.Fatalf("client tool guidance was not preserved for %s: %s", backend, request.Body)
