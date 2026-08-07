@@ -20,7 +20,7 @@ func Path(dataDir string) string {
 func ProxyEnabled(path string) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return false, nil
+		return true, nil
 	}
 	if err != nil {
 		return false, err

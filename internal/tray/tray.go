@@ -171,14 +171,14 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 				operation = operationIdle
 				if r.err != nil {
 					logger.Printf("stop: %v", r.err)
-					dialog.Info("hellogrok 停止失败", "代理已停止接受请求，但配置恢复失败；保留启用状态以便下次启动重试:\n"+r.err.Error())
+					dialog.Info("hellogrok 停止失败", "为避免留下失效代理配置，hellogrok 仍保持运行:\n"+r.err.Error())
 				} else if r.remember {
 					if err := c.SetProxyEnabledOnLaunch(false); err != nil {
 						logger.Printf("remember proxy disabled: %v", err)
 						dialog.Info("hellogrok", "代理已停止，但保存停用状态失败:\n"+err.Error())
 					}
 				}
-				setRunningUI(false)
+				setRunningUI(c.IsRunning())
 
 			case <-mAuto.ClickedCh:
 				next := !c.IsAutostart()
@@ -201,8 +201,13 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 				}
 
 			case <-mQuit.ClickedCh:
+				if err := c.Stop(); err != nil {
+					logger.Printf("quit deferred: %v", err)
+					dialog.Info("hellogrok 无法退出", "为避免留下失效代理配置，hellogrok 仍保持运行:\n"+err.Error())
+					setRunningUI(c.IsRunning())
+					continue
+				}
 				tick.Stop()
-				_ = c.Stop()
 				systray.Quit()
 				return
 			}

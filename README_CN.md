@@ -6,12 +6,12 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.0-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.1-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
 
-[English](./README.md) · [简体中文](./README_CN.md)
+[English](./README.md) · [简体中文](./README_CN.md) · [Changelog](./CHANGELOG.md)
 
 ## 目录
 
@@ -39,6 +39,8 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 
 ## 功能
 
+[完整更新日志](./CHANGELOG.md)
+
 ### 渠道兼容
 
 - 支持上游 `responses`、`chat_completions` 和 Anthropic 兼容 `messages` API。
@@ -65,6 +67,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 
 - 提供 Windows 原生托盘程序和控制台 CLI。
 - 记住用户选择的代理启用状态，并在下次打开托盘时恢复。
+- 首次启动默认启用代理，让新用户立即可用。
 - 支持 Windows、Linux 和 macOS 登录自启动。
 - 提供路由检查、当前状态、实时日志窗口和终端日志跟踪。
 - 支持 Windows、Linux、macOS 的 amd64 和 arm64 构建。
@@ -75,17 +78,19 @@ hellogrok 是 Grok Build 渠道代理，不是系统代理、PAC 服务、VPN �
 
 ### 搜索模式
 
-搜索行为取决于当前自定义模型的 `supports_backend_search` 设置：
+搜索行为优先取决于显式搜索模型，其次取决于当前自定义渠道的 `supports_backend_search` 设置：
 
 | 设置 | 搜索行为 |
 |------|----------|
-| `supports_backend_search = true` | 上游端点支持时，由当前渠道使用自身的 hosted Web search。 |
-| `false` 或缺省，同时配置了 `[models].web_search` | Grok Build 暴露客户端 `web_search`，并使用已配置的搜索模型。 |
-| `false` 或缺省，未配置 `[models].web_search`，但存在有效的 xAI 官方登录或 API 凭据 | Grok Build 可以使用官方默认搜索模型。 |
+| 设置了 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` | 所有自定义对话渠道都通过已选搜索模型使用 Grok Build 客户端 `web_search`。环境变量优先于配置文件的值。 |
+| 未设置搜索模型，`supports_backend_search = true` | 上游端点支持时，由当前渠道使用自身的 hosted Web search。 |
+| 未设置搜索模型，`supports_backend_search = false` | 存在有效 xAI 凭据时，Grok Build 可以使用官方客户端搜索回退。 |
+| 未设置搜索模型，Grok 中转缺省该字段 | hellogrok 启动时自动检测中转的 hosted 搜索能力；确认支持则使用中转的 hosted search，否则保留 Grok Build 官方客户端搜索回退。 |
+| 未设置搜索模型，其他自定义渠道缺省该字段 | 可用时使用 Grok Build 官方客户端搜索回退。 |
 | 没有可用的 hosted 或客户端搜索路径 | 当前模型无法使用 `web_search`。 |
 | `web_fetch` | 独立于搜索模型选择，并受当前工具权限限制。 |
 
-自定义渠道缺省 `supports_backend_search` 时，代理运行期间按 `false` 处理。hellogrok 不会创建、选择或替换 `[models].web_search`；用户显式配置的模型始终是客户端搜索模型。
+hellogrok 不会创建、选择或替换 `[models].web_search`。未选择客户端搜索模型时，渠道显式设置的 `true` 或 `false` 始终优先生效。
 
 ### 配置示例
 
@@ -118,7 +123,7 @@ supports_backend_search = false
 | `auth_scheme` | 否 | 随后端确定 | 上游鉴权方式，包括 Bearer 和 `X-Api-Key` 风格。 |
 | `extra_headers` | 否 | 空 | 额外的渠道自有 HTTP 请求头。 |
 | `env_http_headers` | 否 | 空 | 从环境变量读取的 HTTP 请求头。 |
-| `supports_backend_search` | 否 | `false` | 选择 hosted search（`true`）或 Grok Build 客户端搜索（`false`）。 |
+| `supports_backend_search` | 否 | 自动 | 选择 hosted search（`true`）或 Grok Build 客户端搜索（`false`）；缺省时允许 hellogrok 在启动时检测 Grok 中转。 |
 
 模型设置可以直接写在 `[model.<id>]` 下，也可以从引用的 `[model_providers.<id>]` 继承；模型级设置优先。
 
@@ -195,12 +200,25 @@ Linux 托盘构建需要 GTK 3 和 AppIndicator 开发包，macOS 托盘构建�
 
 Windows 托盘程序和可选 Unix 托盘版提供：
 
-- **启动代理**：启动或停止代理，并记住当前选择。
+- **启动代理**：首次打开默认启用；之后启动或停止代理时记住当前选择。
 - **开机启动**：启用或禁用登录自启动。
 - **状态与日志**：打开当前状态和实时日志窗口。
-- **退出**：恢复配置、停止代理并退出程序。
+- **退出**：恢复配置、停止代理并退出程序。配置所有权冲突时推迟退出。
 
-托盘记忆状态与前台运行的 `hellogrok start` 命令相互独立。
+同一登录会话只运行一个托盘实例；再次打开会直接退出，不会创建第二个托盘。托盘记忆状态与前台运行的 `hellogrok start` 命令相互独立。
+
+**退出保护：** 当供应商管理工具仍持有 Grok Build 配置所有权时，托盘会推迟退出以避免留下孤立代理地址——先解决配置冲突再退出。
+
+### 与 CC Switch 兼容
+
+只有在 CC Switch 不管理 Grok Build 时，它才能与 hellogrok 同时运行。CC Switch 的 Grok Build 代理接管和供应商切换都会写入 `~/.grok/config.toml`；即使两个代理监听不同端口，同时操作仍会发生配置所有权冲突。
+
+- 检测到 CC Switch 的 Grok Build 接管标记（其 `/grokbuild/v1` 地址上的 `PROXY_MANAGED`）时，hellogrok 会拒绝启动。
+- 如果先启动 hellogrok、随后误开 CC Switch 接管，hellogrok 会拒绝停止或退出，直到 CC Switch 先释放 Grok Build，避免 CC Switch 日后恢复已停服的 `127.0.0.1:18787` 地址。
+- 如果供应商管理工具已整份替换 Grok 实时配置，且其中不再包含任何 hellogrok 地址，hellogrok 会保留外部配置并放弃过期的恢复状态。
+- hellogrok 运行期间，CC Switch 仍可管理 Claude、Codex、Gemini 等其他应用。
+
+如果误开了两个 Grok 代理，应先关闭 CC Switch 的 Grok Build 代理接管，再停止 hellogrok。hellogrok 运行期间不要切换 CC Switch 的 Grok Build 供应商。
 
 ### CLI 命令
 
@@ -277,7 +295,7 @@ Configured custom API channel
 
 ### 无法使用 `web_search`
 
-检查当前模型的搜索模式。`true` 渠道需要上游真实提供 hosted search；`false` 或缺省渠道需要有效的 `[models].web_search` 模型或可用的 xAI 官方凭据。`web_fetch` 与搜索模型独立，但仍可能被当前工具权限排除。
+查看启动日志中的搜索路由。hosted 渠道需要上游返回真实搜索证据；客户端搜索路径需要有效的 `[models].web_search` 模型或可用的 xAI 官方凭据。`web_fetch` 与搜索模型独立，但仍可能被当前工具权限排除。
 
 ### 请求返回 401、403 或 502
 
@@ -294,6 +312,10 @@ Configured custom API channel
 ### 开机启动成功，但渠道没有凭据
 
 把只在终端中存在的环境变量写入持久用户环境或服务环境，然后重新启动登录服务。自启动进程无法继承先前终端会话里的临时变量。
+
+### 供应商管理工具持有 Grok Build 时无法退出
+
+先打开供应商管理工具（如 CC Switch）关闭其 Grok Build 接管，再退出 hellogrok。这避免 CC Switch 日后恢复指向已停服代理的路由。
 
 ## 开发与测试
 

@@ -188,14 +188,45 @@ func toolChoiceDisablesTools(choice any) bool {
 	}
 }
 
-// normalizeHostedSearchRequest emits the hosted-search dialect expected by the
-// selected upstream. Grok Build routes receive both of Build's native search
-// declarations; other Responses providers receive only standard web_search.
+type hostedSearchCapabilities struct {
+	Web bool
+	X   bool
+}
+
+func (c hostedSearchCapabilities) any() bool {
+	return c.Web || c.X
+}
+
+// normalizeHostedSearchRequest preserves the historical wrapper used by the
+// focused normalization tests. Runtime routing uses the capability-aware
+// variant below.
 func normalizeHostedSearchRequest(body []byte, grokRoute bool) ([]byte, bool, error) {
+	return normalizeHostedSearchRequestForCapabilities(body, hostedSearchCapabilities{
+		Web: true,
+		X:   grokRoute,
+	})
+}
+
+// normalizeHostedSearchRequestForCapabilities emits only the hosted-search
+// declarations confirmed for the selected upstream. Ordinary function tools
+// remain untouched when no hosted search capability is available.
+func normalizeHostedSearchRequestForCapabilities(body []byte, capabilities hostedSearchCapabilities) ([]byte, bool, error) {
 	root, err := decodeRequestObject(body)
 	if err != nil {
 		return body, false, err
 	}
+	changed := normalizeHostedSearchObject(root, capabilities)
+	if !changed {
+		return body, false, nil
+	}
+	out, err := encodeRequestObject(root)
+	if err != nil {
+		return body, false, err
+	}
+	return out, true, nil
+}
+
+func normalizeHostedSearchObject(root map[string]any, capabilities hostedSearchCapabilities) bool {
 	changed := repairDeepSeekSearchReplay(root)
 
 	tools, _ := root["tools"].([]any)
@@ -222,11 +253,11 @@ func normalizeHostedSearchRequest(body []byte, grokRoute bool) ([]byte, bool, er
 			}
 		}
 	}
-	if canonicalWeb == nil && hasHosted {
+	if canonicalWeb == nil && hasHosted && capabilities.Web {
 		canonicalWeb = map[string]any{"type": "web_search"}
 		changed = true
 	}
-	if grokRoute && canonicalX == nil && hasHosted {
+	if canonicalX == nil && hasHosted && capabilities.X {
 		canonicalX = map[string]any{"type": "x_search"}
 		changed = true
 	}
@@ -237,15 +268,17 @@ func normalizeHostedSearchRequest(body []byte, grokRoute bool) ([]byte, bool, er
 		typ := stringValue(tool["type"])
 		if isHostedWebSearchType(typ) || typ == "x_search" {
 			if !hostedInserted {
-				normalized = append(normalized, canonicalWeb)
-				if grokRoute {
+				if capabilities.Web {
+					normalized = append(normalized, canonicalWeb)
+				}
+				if capabilities.X {
 					normalized = append(normalized, canonicalX)
 				}
 				hostedInserted = true
 			}
 			continue
 		}
-		if hasHosted && isSearchFunctionTool(tool) {
+		if hasHosted && capabilities.any() && isSearchFunctionTool(tool) {
 			changed = true
 			continue
 		}
@@ -253,8 +286,10 @@ func normalizeHostedSearchRequest(body []byte, grokRoute bool) ([]byte, bool, er
 	}
 	if hasHosted {
 		if !hostedInserted {
-			normalized = append(normalized, canonicalWeb)
-			if grokRoute {
+			if capabilities.Web {
+				normalized = append(normalized, canonicalWeb)
+			}
+			if capabilities.X {
 				normalized = append(normalized, canonicalX)
 			}
 		}
@@ -263,17 +298,10 @@ func normalizeHostedSearchRequest(body []byte, grokRoute bool) ([]byte, bool, er
 			changed = true
 		}
 	}
-	if hasHosted && normalizeHostedToolChoice(root["tool_choice"], grokRoute) {
+	if hasHosted && normalizeHostedToolChoice(root, capabilities) {
 		changed = true
 	}
-	if !changed {
-		return body, false, nil
-	}
-	out, err := encodeRequestObject(root)
-	if err != nil {
-		return body, false, err
-	}
-	return out, true, nil
+	return changed
 }
 
 // DeepSeek Responses returns a non-standard action.queries field and requires
@@ -334,44 +362,62 @@ func isSearchFunctionTool(tool map[string]any) bool {
 	return name == "web_search" || name == "x_search"
 }
 
-func normalizeHostedToolChoice(choice any, grokRoute bool) bool {
+func normalizeHostedToolChoice(root map[string]any, capabilities hostedSearchCapabilities) bool {
+	choice := root["tool_choice"]
+	if choice == "required" && !requestHasCallableTools(root) {
+		delete(root, "tool_choice")
+		return true
+	}
 	value, ok := choice.(map[string]any)
 	if !ok {
 		return false
 	}
 	typ := strings.ToLower(strings.TrimSpace(stringValue(value["type"])))
 	if typ == "allowed_tools" {
-		return normalizeAllowedHostedTools(value, grokRoute)
+		changed, empty := normalizeAllowedHostedTools(value, capabilities)
+		if empty {
+			delete(root, "tool_choice")
+			return true
+		}
+		return changed
 	}
 	name := strings.ToLower(strings.TrimSpace(stringValue(value["name"])))
 	if function, _ := value["function"].(map[string]any); name == "" && function != nil {
 		name = strings.ToLower(strings.TrimSpace(stringValue(function["name"])))
 	}
-	if typ == "web_search" {
+	if typ == "web_search" && capabilities.Web {
 		return false
 	}
-	if grokRoute && typ == "x_search" {
+	if typ == "x_search" && capabilities.X {
 		return false
 	}
-	if typ != "x_search" && !isHostedWebSearchType(typ) &&
-		!(typ == "function" && (name == "web_search" || name == "x_search")) {
+	isHostedChoice := typ == "x_search" || isHostedWebSearchType(typ)
+	isCollidingFunction := typ == "function" && (name == "web_search" || name == "x_search")
+	if !isHostedChoice && !(capabilities.any() && isCollidingFunction) {
 		return false
+	}
+	if !capabilities.any() {
+		delete(root, "tool_choice")
+		return true
 	}
 	for key := range value {
 		delete(value, key)
 	}
-	if grokRoute && name == "x_search" {
+	preferX := typ == "x_search" || name == "x_search"
+	if preferX && capabilities.X {
 		value["type"] = "x_search"
-	} else {
+	} else if capabilities.Web {
 		value["type"] = "web_search"
+	} else {
+		value["type"] = "x_search"
 	}
 	return true
 }
 
-func normalizeAllowedHostedTools(choice map[string]any, grokRoute bool) bool {
+func normalizeAllowedHostedTools(choice map[string]any, capabilities hostedSearchCapabilities) (changed, empty bool) {
 	allowed, ok := choice["tools"].([]any)
 	if !ok {
-		return false
+		return false, false
 	}
 	var normalized []any
 	searchSeen := false
@@ -379,9 +425,9 @@ func normalizeAllowedHostedTools(choice map[string]any, grokRoute bool) bool {
 		tool, _ := raw.(map[string]any)
 		typ := strings.ToLower(strings.TrimSpace(stringValue(tool["type"])))
 		name := strings.ToLower(strings.TrimSpace(functionToolName(tool)))
-		isSearch := typ == "x_search" || isHostedWebSearchType(typ) ||
-			(typ == "function" && (name == "web_search" || name == "x_search"))
-		if !isSearch {
+		isHosted := typ == "x_search" || isHostedWebSearchType(typ)
+		isCollidingFunction := typ == "function" && (name == "web_search" || name == "x_search")
+		if !isHosted && !(capabilities.any() && isCollidingFunction) {
 			normalized = append(normalized, raw)
 			continue
 		}
@@ -389,16 +435,32 @@ func normalizeAllowedHostedTools(choice map[string]any, grokRoute bool) bool {
 			continue
 		}
 		searchSeen = true
-		normalized = append(normalized, map[string]any{"type": "web_search"})
-		if grokRoute {
+		if capabilities.Web {
+			normalized = append(normalized, map[string]any{"type": "web_search"})
+		}
+		if capabilities.X {
 			normalized = append(normalized, map[string]any{"type": "x_search"})
 		}
 	}
 	if !searchSeen || sameJSONValue(allowed, normalized) {
-		return false
+		return false, len(normalized) == 0
 	}
 	choice["tools"] = normalized
-	return true
+	return true, len(normalized) == 0
+}
+
+func requestHasCallableTools(root map[string]any) bool {
+	for _, raw := range anySlice(root["tools"]) {
+		tool, _ := raw.(map[string]any)
+		if tool == nil {
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(stringValue(tool["type"])))
+		if typ == "function" || typ == "x_search" || isHostedWebSearchType(typ) {
+			return true
+		}
+	}
+	return false
 }
 
 func sameJSONValue(left, right any) bool {

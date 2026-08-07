@@ -80,17 +80,24 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 	stream, _ := root["stream"].(bool)
 	_, _, buildHostedSearch, _, buildXSearch := summarizeBody(body)
 	root["model"] = route.WireModel
+	clientSearchPrepared := prepareClientSearchExecution(root, buildHostedSearch, buildXSearch)
 	proxyAddedSearch := false
-	if route.SupportsBackendSearch {
-		proxyAddedSearch = ensureHostedWebSearch(root)
-	}
 	clientSearchForced := false
 	clientSearchAlias := ""
-	if !route.SupportsBackendSearch {
+	capabilities := hostedSearchCapabilities{}
+	if clientSearchPrepared {
+		// Build's WebSearchClient always sends exactly one hosted web_search
+		// request. It is independent of the conversation model's backend-search
+		// setting and must never gain x_search.
+		capabilities.Web = true
+	} else if route.SupportsBackendSearch {
+		capabilities = routeHostedSearchCapabilities(route)
+		proxyAddedSearch = ensureHostedSearch(root, capabilities)
+	} else {
 		clientSearchForced = prepareClientWebSearch(root)
 		clientSearchAlias = chooseClientWebSearchWireAlias(root)
 	}
-	clientSearchPrepared := prepareClientSearchExecution(root, buildHostedSearch, buildXSearch)
+	normalizeHostedSearchObject(root, capabilities)
 	hosted := hasHostedSearchTool(root)
 	query := lastUserText(root["input"])
 	requestInfo := facadeRequest{
@@ -114,12 +121,6 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 		encoded, err := encodeRequestObject(root)
 		if err != nil {
 			return facadeRequest{}, err
-		}
-		if hosted {
-			encoded, _, err = normalizeHostedSearchRequest(encoded, isGrokRoute(route))
-			if err != nil {
-				return facadeRequest{}, err
-			}
 		}
 		requestInfo.Body = encoded
 		requestInfo.Protocol = wireResponses
@@ -437,16 +438,36 @@ func userRequestsSubagentDelegation(text string) bool {
 	return false
 }
 
-// ensureHostedWebSearch exposes hosted search only for channels that explicitly
-// declare supports_backend_search. Client web_search functions on other routes
-// must remain ordinary functions for Grok Build to execute locally.
-func ensureHostedWebSearch(root map[string]any) bool {
+func routeHostedSearchCapabilities(route config.Route) hostedSearchCapabilities {
+	if route.HostedSearchKnown {
+		return hostedSearchCapabilities{Web: route.HostedWebSearch, X: route.HostedXSearch}
+	}
+	return hostedSearchCapabilities{
+		Web: true,
+		X:   strings.EqualFold(strings.TrimSpace(route.APIBackend), "responses") && isGrokRoute(route),
+	}
+}
+
+// ensureHostedSearch exposes hosted tools only for channels whose effective
+// route enables backend search. Capability-aware normalization below removes
+// any unsupported member of the pair.
+func ensureHostedSearch(root map[string]any, capabilities hostedSearchCapabilities) bool {
 	if root == nil || toolChoiceDisablesTools(root["tool_choice"]) ||
-		!toolChoiceAllowsHostedSearch(root["tool_choice"]) || hasHostedSearchTool(root) {
+		!toolChoiceAllowsHostedSearch(root["tool_choice"]) || hasHostedSearchTool(root) ||
+		!capabilities.any() {
 		return false
 	}
-	root["tools"] = append(anySlice(root["tools"]), map[string]any{"type": "web_search"})
-	return true
+	tools := anySlice(root["tools"])
+	webAdded := false
+	if capabilities.Web {
+		tools = append(tools, map[string]any{"type": "web_search"})
+		webAdded = true
+	}
+	if capabilities.X {
+		tools = append(tools, map[string]any{"type": "x_search"})
+	}
+	root["tools"] = tools
+	return webAdded
 }
 
 func hasHostedSearchTool(root map[string]any) bool {
@@ -565,13 +586,14 @@ func responsesToChatRequest(root map[string]any, route config.Route) (map[string
 		}
 	}
 	if hosted && !toolsDisabled {
-		if isXAIChatRoute(route) {
+		switch chatSearchDialect(route) {
+		case config.ChatSearchDialectSearchParameters:
 			mode := "auto"
 			if hostedToolChoiceRequired(root["tool_choice"]) {
 				mode = "on"
 			}
 			out["search_parameters"] = map[string]any{"mode": mode, "sources": []any{map[string]any{"type": "web"}}}
-		} else {
+		default:
 			out["web_search_options"] = map[string]any{}
 		}
 	}
@@ -857,6 +879,17 @@ func containsMessagesHostedSearch(tools []any) bool {
 
 func isXAIChatRoute(route config.Route) bool {
 	return isGrokRoute(route)
+}
+
+func chatSearchDialect(route config.Route) config.ChatSearchDialect {
+	switch route.HostedChatSearchDialect {
+	case config.ChatSearchDialectSearchParameters, config.ChatSearchDialectWebSearchOptions:
+		return route.HostedChatSearchDialect
+	}
+	if isXAIChatRoute(route) {
+		return config.ChatSearchDialectSearchParameters
+	}
+	return config.ChatSearchDialectWebSearchOptions
 }
 
 func isGrokRoute(route config.Route) bool {

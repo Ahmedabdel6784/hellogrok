@@ -22,6 +22,7 @@ type Model struct {
 	APIBaseURL            string
 	APIBackend            string
 	SupportsBackendSearch bool
+	BackendSearchSet      bool
 	AuthScheme            string
 	IncomingAuthScheme    string
 	APIKey                string
@@ -32,6 +33,15 @@ type Model struct {
 	ExtraHeaders          map[string]string
 	EnvHTTPHeaders        map[string]string
 }
+
+// ChatSearchDialect identifies the provider extension used to enable hosted
+// web search on a Chat Completions request.
+type ChatSearchDialect string
+
+const (
+	ChatSearchDialectSearchParameters ChatSearchDialect = "search_parameters"
+	ChatSearchDialectWebSearchOptions ChatSearchDialect = "web_search_options"
+)
 
 // authProviderConfig mirrors the fields Grok Build accepts in
 // [auth_provider.*] and [model_providers.*.auth]. Keeping this typed prevents
@@ -65,6 +75,27 @@ type Route struct {
 	// declaration for this channel. False keeps Build's client web_search path
 	// intact for an explicit search model or Build's authenticated default.
 	SupportsBackendSearch bool
+	// BackendSearchSet distinguishes a user/provider declaration from Build's
+	// false default. Missing values are eligible for runtime capability probing.
+	BackendSearchSet bool
+	// HostedSearchKnown makes the two capability bits authoritative. When false,
+	// an explicit supports_backend_search=true declaration keeps the historical
+	// provider-specific defaults until a probe supplies a finer result.
+	HostedSearchKnown bool
+	HostedWebSearch   bool
+	HostedXSearch     bool
+	// HostedChatSearchDialect is discovered at runtime and never written to the
+	// Grok configuration. It is empty for non-Chat routes or unknown providers.
+	HostedChatSearchDialect ChatSearchDialect
+}
+
+// WebSearchSelection is an explicitly selected Build client-search model.
+// Build also has an authenticated compiled default; Explicit deliberately does
+// not report that implicit fallback.
+type WebSearchSelection struct {
+	Model    string
+	Explicit bool
+	Source   string
 }
 
 // GrokHome returns ~/.grok (or GROK_HOME).
@@ -126,7 +157,7 @@ func LoadModels(path string) ([]Model, error) {
 		baseURL := inheritedString(m, provider, "base_url")
 		apiBaseURL := inheritedString(m, provider, "api_base_url")
 		apiBackend := strings.ToLower(inheritedString(m, provider, "api_backend"))
-		supportsBackendSearch, err := inheritedBool(m, provider, "supports_backend_search")
+		supportsBackendSearch, backendSearchSet, err := inheritedBool(m, provider, "supports_backend_search")
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].supports_backend_search %w", id, err)
 		}
@@ -182,6 +213,7 @@ func LoadModels(path string) ([]Model, error) {
 			APIBaseURL:            apiBaseURL,
 			APIBackend:            apiBackend,
 			SupportsBackendSearch: supportsBackendSearch,
+			BackendSearchSet:      backendSearchSet,
 			AuthScheme:            upstreamAuthScheme,
 			IncomingAuthScheme:    modelAuthScheme,
 			APIKey:                apiKey,
@@ -218,7 +250,7 @@ func inheritedString(model, provider map[string]any, key string) string {
 	return ""
 }
 
-func inheritedBool(model, provider map[string]any, key string) (bool, error) {
+func inheritedBool(model, provider map[string]any, key string) (bool, bool, error) {
 	for _, values := range []map[string]any{model, provider} {
 		if values == nil {
 			continue
@@ -229,11 +261,41 @@ func inheritedBool(model, provider map[string]any, key string) (bool, error) {
 		}
 		value, ok := raw.(bool)
 		if !ok {
-			return false, fmt.Errorf("must be a boolean")
+			return false, true, fmt.Errorf("must be a boolean")
 		}
-		return value, nil
+		return value, true, nil
 	}
-	return false, nil
+	return false, false, nil
+}
+
+// LoadWebSearchSelection resolves only explicit client-search choices. The
+// environment has the same precedence as Grok Build and an empty value is
+// treated as absent.
+func LoadWebSearchSelection(path string) (WebSearchSelection, error) {
+	if value := strings.TrimSpace(os.Getenv("GROK_WEB_SEARCH_MODEL")); value != "" {
+		return WebSearchSelection{Model: value, Explicit: true, Source: "environment"}, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return WebSearchSelection{}, err
+	}
+	var root map[string]any
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return WebSearchSelection{}, fmt.Errorf("parse toml: %w", err)
+	}
+	models, _ := root["models"].(map[string]any)
+	if models == nil {
+		return WebSearchSelection{}, nil
+	}
+	value, exists := models["web_search"]
+	if !exists {
+		return WebSearchSelection{}, nil
+	}
+	model, ok := value.(string)
+	if !ok {
+		return WebSearchSelection{}, fmt.Errorf("[models].web_search must be a string")
+	}
+	return WebSearchSelection{Model: strings.TrimSpace(model), Explicit: true, Source: "config"}, nil
 }
 
 func stringField(values map[string]any, key string) (string, bool) {
@@ -454,6 +516,7 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			DynamicAuth:           m.DynamicAuth && key == "",
 			ExtraHeaders:          resolveExtraHeaders(m),
 			SupportsBackendSearch: m.SupportsBackendSearch,
+			BackendSearchSet:      m.BackendSearchSet,
 		})
 	}
 	return out, nil

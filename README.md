@@ -6,12 +6,12 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.0-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.1-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
 
-[English](./README.md) · [简体中文](./README_CN.md)
+[English](./README.md) · [简体中文](./README_CN.md) · [Changelog](./CHANGELOG.md)
 
 ## Contents
 
@@ -39,6 +39,8 @@ It is intended for users who maintain multiple third-party model channels and wa
 
 ## Features
 
+[Full Changelog](./CHANGELOG.md)
+
 ### Channel compatibility
 
 - Supports upstream `responses`, `chat_completions`, and Anthropic-compatible `messages` APIs.
@@ -65,6 +67,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 
 - Provides a native Windows tray application and a console CLI.
 - Remembers the user's proxy-enabled choice between tray launches.
+- Defaults to proxy-enabled on first launch so new users see a working proxy immediately.
 - Includes login autostart controls for Windows, Linux, and macOS.
 - Provides route inspection, current status, a live log window, and terminal log following.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
@@ -75,17 +78,19 @@ hellogrok is a Grok Build channel proxy. It is not a system proxy, PAC service, 
 
 ### Search modes
 
-Search behavior follows the selected custom model's `supports_backend_search` setting:
+Search behavior follows the explicit search-model selection first, then the selected custom channel's `supports_backend_search` setting:
 
 | Setting | Search behavior |
 |---------|-----------------|
-| `supports_backend_search = true` | The selected channel uses its own hosted Web search when its upstream endpoint supports it. |
-| `false` or omitted, with `[models].web_search` configured | Grok Build exposes client `web_search` and uses the configured search model. |
-| `false` or omitted, without `[models].web_search`, with a valid official xAI login or API credential | Grok Build can use its official default search model. |
+| `[models].web_search` or `GROK_WEB_SEARCH_MODEL` is set | All custom conversation channels use Grok Build client `web_search` through the selected search model. The environment variable takes precedence over the config file value. |
+| No search model, `supports_backend_search = true` | The selected channel uses its own hosted Web search when its upstream endpoint supports it. |
+| No search model, `supports_backend_search = false` | Grok Build uses its official client-search fallback when valid xAI credentials are available. |
+| No search model, setting omitted on a Grok relay | hellogrok auto-detects the relay's hosted search capability at startup; confirmed hosted search uses the relay, otherwise Grok Build keeps its official client-search fallback. |
+| No search model, setting omitted on another custom channel | Grok Build uses its official client-search fallback when available. |
 | No usable hosted or client search path | `web_search` is unavailable for that model. |
 | `web_fetch` | Remains independent of the search-model selection and follows the active tool permissions. |
 
-An omitted `supports_backend_search` value is treated as `false` for a custom channel while the proxy is running. hellogrok never creates, selects, or replaces `[models].web_search`; an explicit user setting always remains the selected client search model.
+hellogrok never creates, selects, or replaces `[models].web_search`. Explicit `true` and `false` channel settings remain authoritative when no client search model is selected.
 
 ### Example configuration
 
@@ -118,7 +123,7 @@ Set `supports_backend_search = true` instead when that channel should execute it
 | `auth_scheme` | No | Backend-dependent | Upstream authentication scheme, including Bearer and `X-Api-Key` styles. |
 | `extra_headers` | No | Empty | Additional channel-owned HTTP headers. |
 | `env_http_headers` | No | Empty | HTTP headers populated from environment variables. |
-| `supports_backend_search` | No | `false` | Selects hosted search (`true`) or Grok Build client search (`false`). |
+| `supports_backend_search` | No | Automatic | Selects hosted search (`true`) or Grok Build client search (`false`); an omitted value lets hellogrok check Grok relays at startup. |
 
 Model settings may be declared directly under `[model.<id>]` or inherited from a referenced `[model_providers.<id>]`. Model-level values take precedence.
 
@@ -195,12 +200,25 @@ Current Windows and macOS artifacts are not code-signed or notarized.
 
 The Windows tray application and optional Unix tray build provide:
 
-- **Start proxy** — starts or stops the proxy and remembers the selected state.
+- **Start proxy** — enabled by default on first launch; later starts and stops remember the selected state.
 - **Autostart** — enables or disables login startup.
 - **Status and logs** — opens the current status and live log window.
-- **Exit** — restores the configuration, stops the proxy, and exits.
+- **Exit** — restores the configuration, stops the proxy, and exits. Defers when a config-ownership conflict exists.
 
-The remembered tray state is independent from the foreground `hellogrok start` command.
+Only one tray instance runs in a login session; launching it again exits immediately instead of creating a second tray. The remembered tray state is independent from the foreground `hellogrok start` command.
+
+**Quit protection**: When a provider manager still owns Grok Build's configuration, the tray defers exit to avoid leaving an orphaned proxy route — resolve the configuration conflict first, then quit.
+
+### Compatibility with CC Switch
+
+CC Switch and hellogrok can run at the same time only when CC Switch is not managing Grok Build. CC Switch's Grok Build proxy takeover and provider switch both write `~/.grok/config.toml`; using either operation while hellogrok owns that file creates a configuration-ownership conflict even though the proxies listen on different ports.
+
+- hellogrok refuses to start when it detects CC Switch's Grok Build takeover marker (`PROXY_MANAGED` on its `/grokbuild/v1` route).
+- If CC Switch takeover is enabled after hellogrok starts, hellogrok refuses to stop or exit until CC Switch releases Grok Build. This keeps CC Switch from later restoring a stopped `127.0.0.1:18787` route.
+- If a provider manager completely replaces the live Grok config and no hellogrok route remains, hellogrok preserves the external config and relinquishes its obsolete recovery state.
+- CC Switch may continue managing Claude, Codex, Gemini, and other applications while hellogrok is active.
+
+If both Grok proxies were enabled accidentally, disable CC Switch's Grok Build takeover first, then stop hellogrok. Avoid switching the CC Switch Grok Build provider while hellogrok is active.
 
 ### CLI reference
 
@@ -277,7 +295,7 @@ Confirm that the intended `[model.<id>]` or referenced provider has a valid `bas
 
 ### `web_search` is unavailable
 
-Check the model's search mode. A `true` channel needs working hosted search from its upstream. A `false` or omitted channel needs either a valid `[models].web_search` model or usable official xAI credentials. `web_fetch` is independent but can still be removed by the active tool permissions.
+Check the startup log for the selected search route. A hosted channel needs real upstream search evidence. A client-search route needs either a valid `[models].web_search` model or usable official xAI credentials. `web_fetch` is independent but can still be removed by the active tool permissions.
 
 ### A request returns 401, 403, or 502
 
@@ -294,6 +312,10 @@ Stop the existing hellogrok instance before starting another one. Only one insta
 ### Autostart works, but a channel has no credentials
 
 Move shell-only environment variables into the persistent user or service environment, then restart the login service. The autostart process cannot inherit variables that existed only in an earlier terminal session.
+
+### Cannot quit while a provider manager owns Grok Build
+
+Open the provider manager (e.g., CC Switch) and disable its Grok Build takeover first, then quit hellogrok. This prevents CC Switch from later restoring a route to a stopped proxy.
 
 ## Development
 

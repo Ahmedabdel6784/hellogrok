@@ -2,6 +2,7 @@ package cfgpatch
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,7 +20,9 @@ import (
 const (
 	ProxyHost    = "127.0.0.1"
 	ProxyPort    = "18787"
-	stateVersion = 4
+	stateVersion = 5
+
+	ccSwitchProxyToken = "PROXY_MANAGED"
 )
 
 var (
@@ -54,6 +57,18 @@ type Target struct {
 	SupportsBackendSearch bool
 }
 
+// CCSwitchTakeover identifies CC Switch's Grok Build live-proxy projection.
+// Both applications rewrite ~/.grok/config.toml, so this state must not be
+// wrapped by hellogrok or treated as an ordinary custom provider.
+type CCSwitchTakeover struct {
+	ModelID string
+	BaseURL string
+}
+
+func (t CCSwitchTakeover) Active() bool {
+	return t.ModelID != ""
+}
+
 // State contains the exact lines replaced by hellogrok. It is written before
 // config.toml so an unclean exit can restore every managed field.
 type State struct {
@@ -65,33 +80,31 @@ type State struct {
 }
 
 type FeatureState struct {
-	SectionCreated    bool             `json:"section_created,omitempty"`
-	AppendPrefix      string           `json:"append_prefix,omitempty"`
-	HeaderEndingAdded bool             `json:"header_ending_added,omitempty"`
-	BackendTools      ManagedLineState `json:"backend_tools"`
-	WebFetch          ManagedLineState `json:"web_fetch"`
+	SectionCreated bool             `json:"section_created,omitempty"`
+	AppendPrefix   string           `json:"append_prefix,omitempty"`
+	BackendTools   ManagedLineState `json:"backend_tools"`
+	WebFetch       ManagedLineState `json:"web_fetch"`
 }
 
 type SubagentState struct {
 	SectionCreated    bool             `json:"section_created,omitempty"`
 	DottedLineCreated bool             `json:"dotted_line_created,omitempty"`
-	HeaderEndingAdded bool             `json:"header_ending_added,omitempty"`
 	Enabled           ManagedLineState `json:"enabled"`
 }
 
 type ModelState struct {
-	HeaderEndingAdded bool             `json:"header_ending_added,omitempty"`
-	BaseURL           ManagedLineState `json:"base_url"`
-	APIBaseURL        ManagedLineState `json:"api_base_url,omitempty"`
-	APIBackend        ManagedLineState `json:"api_backend"`
-	BackendSearch     ManagedLineState `json:"backend_search"`
+	BaseURL       ManagedLineState `json:"base_url"`
+	APIBaseURL    ManagedLineState `json:"api_base_url,omitempty"`
+	APIBackend    ManagedLineState `json:"api_backend"`
+	BackendSearch ManagedLineState `json:"backend_search"`
 }
 
 type ManagedLineState struct {
-	Managed      bool   `json:"managed"`
-	Present      bool   `json:"present"`
-	OriginalLine string `json:"original_line,omitempty"`
-	AppliedValue string `json:"applied_value"`
+	Managed          bool   `json:"managed"`
+	Present          bool   `json:"present"`
+	OriginalLine     string `json:"original_line,omitempty"`
+	AppliedValue     string `json:"applied_value"`
+	PreviousLineHash string `json:"previous_line_hash,omitempty"`
 }
 
 type ApplyResult struct {
@@ -128,6 +141,103 @@ func IsProxyURL(raw string) bool {
 	loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
 	return loopback && u.Port() == ProxyPort &&
 		strings.HasPrefix(u.EscapedPath(), "/c/")
+}
+
+// DetectCCSwitchTakeover looks for the two fields CC Switch writes together
+// when its Grok Build proxy takeover is active. The listen address and port are
+// configurable, so detection uses the dedicated route and token marker instead
+// of assuming 127.0.0.1:15721.
+func DetectCCSwitchTakeover(configPath string) (CCSwitchTakeover, error) {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return CCSwitchTakeover{}, err
+	}
+	var root map[string]any
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return CCSwitchTakeover{}, fmt.Errorf("parse TOML: %w", err)
+	}
+	models, _ := root["model"].(map[string]any)
+	if len(models) == 0 {
+		return CCSwitchTakeover{}, nil
+	}
+
+	ids := make([]string, 0, len(models))
+	if selection, _ := root["models"].(map[string]any); selection != nil {
+		if id, _ := selection["default"].(string); strings.TrimSpace(id) != "" {
+			ids = append(ids, strings.TrimSpace(id))
+		}
+	}
+	remaining := make([]string, 0, len(models))
+	for id := range models {
+		if len(ids) == 0 || id != ids[0] {
+			remaining = append(remaining, id)
+		}
+	}
+	sort.Strings(remaining)
+	ids = append(ids, remaining...)
+
+	for _, id := range ids {
+		model, _ := models[id].(map[string]any)
+		apiKey, _ := model["api_key"].(string)
+		baseURL, _ := model["base_url"].(string)
+		if strings.TrimSpace(apiKey) == ccSwitchProxyToken && isCCSwitchGrokProxyURL(baseURL) {
+			return CCSwitchTakeover{ModelID: id, BaseURL: strings.TrimSpace(baseURL)}, nil
+		}
+	}
+	return CCSwitchTakeover{}, nil
+}
+
+func isCCSwitchGrokProxyURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	return strings.TrimSpace(u.Hostname()) != "" && u.Port() != "" &&
+		strings.TrimRight(u.EscapedPath(), "/") == "/grokbuild/v1"
+}
+
+// ActiveProxyReferences reports config fields that still point at this
+// hellogrok instance. It is used before relinquishing a recovery transaction
+// after another application has replaced the live provider configuration.
+func ActiveProxyReferences(configPath string) ([]string, error) {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	var root map[string]any
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("parse TOML: %w", err)
+	}
+	models, _ := root["model"].(map[string]any)
+	refs := make([]string, 0)
+	for id, value := range models {
+		model, _ := value.(map[string]any)
+		for _, field := range []string{"base_url", "api_base_url"} {
+			if endpoint, _ := model[field].(string); IsProxyURL(endpoint) {
+				refs = append(refs, id+"."+field)
+			}
+		}
+	}
+	sort.Strings(refs)
+	return refs, nil
+}
+
+// Relinquish removes hellogrok's recovery transaction only when the live
+// config no longer contains a hellogrok route. This preserves a complete
+// external provider switch without leaving a stale transaction that blocks the
+// next start.
+func Relinquish(configPath, statePath string) (bool, error) {
+	refs, err := ActiveProxyReferences(configPath)
+	if err != nil {
+		return false, err
+	}
+	if len(refs) != 0 {
+		return false, nil
+	}
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	return true, nil
 }
 
 func ChannelIDFromProxyURL(raw string) string {
@@ -427,19 +537,21 @@ func rewriteSubagentEnabled(text string, root map[string]any, state *State) (str
 			sectionEnd = len(lines)
 		}
 		block := append([]string(nil), lines[sectionStart:sectionEnd]...)
-		if len(block) > 0 && lineEnding(block[0]) == "" {
-			block[0] += ending
-			state.Subagents.HeaderEndingAdded = true
-		}
-		state.Subagents.Enabled = ManagedLineState{Managed: true, Present: false, AppliedValue: "true"}
-		block = append(block, "")
-		copy(block[2:], block[1:])
-		block[1] = "enabled = true" + ending
+		changed := 0
+		fields := []managedField{{
+			name:       "enabled",
+			pattern:    subagentsEnabledLine,
+			anyPattern: subagentsEnabledAnyLine,
+			value:      "true",
+			state:      &state.Subagents.Enabled,
+			changed:    &changed,
+		}}
+		block = rewriteManagedFields(block, 1, fields, ending)
 		updated := make([]string, 0, len(lines)+1)
 		updated = append(updated, lines[:sectionStart]...)
 		updated = append(updated, block...)
 		updated = append(updated, lines[sectionEnd:]...)
-		return strings.Join(updated, ""), 1, nil
+		return strings.Join(updated, ""), changed, nil
 	}
 
 	state.Subagents.Enabled = ManagedLineState{Managed: true, Present: false, AppliedValue: "true"}
@@ -453,10 +565,31 @@ func rewriteSubagentEnabled(text string, root map[string]any, state *State) (str
 		return strings.Join(updated, ""), 1, nil
 	}
 
-	// Dotted keys have no section header to extend. A top-level dotted enabled
-	// key preserves the original representation; inline sealed tables reject the
-	// candidate and are reported instead of being reformatted destructively.
-	candidate := "subagents.enabled = true" + ending + text
+	// Dotted keys belong to the root table. Append the default at that table's
+	// footer; inline sealed tables reject the candidate instead of being
+	// reformatted destructively.
+	rootEnd := len(lines)
+	for index, line := range lines {
+		if structural[index] && sectionRe.MatchString(strings.TrimSpace(line)) {
+			rootEnd = index
+			break
+		}
+	}
+	rootBlock := append([]string(nil), lines[:rootEnd]...)
+	changed := 0
+	fields := []managedField{{
+		name:       "subagents.enabled",
+		pattern:    subagentsEnabledDottedLine,
+		anyPattern: subagentsEnabledDottedAnyLine,
+		value:      "true",
+		state:      &state.Subagents.Enabled,
+		changed:    &changed,
+	}}
+	rootBlock = rewriteManagedFields(rootBlock, 0, fields, ending)
+	candidateLines := make([]string, 0, len(lines)+1)
+	candidateLines = append(candidateLines, rootBlock...)
+	candidateLines = append(candidateLines, lines[rootEnd:]...)
+	candidate := strings.Join(candidateLines, "")
 	var candidateRoot map[string]any
 	if err := toml.Unmarshal([]byte(candidate), &candidateRoot); err != nil {
 		return text, 0, fmt.Errorf("repair omitted [subagents].enabled: unsupported inline subagents table: %w", err)
@@ -466,7 +599,7 @@ func rewriteSubagentEnabled(text string, root map[string]any, state *State) (str
 		return text, 0, fmt.Errorf("repair omitted [subagents].enabled: dotted key did not produce a boolean")
 	}
 	state.Subagents.DottedLineCreated = true
-	return candidate, 1, nil
+	return candidate, changed, nil
 }
 
 func rewriteFeatureFlags(text string, state *State) (string, ApplyResult, error) {
@@ -512,57 +645,11 @@ func rewriteFeatureFlags(text string, state *State) (string, ApplyResult, error)
 	}
 
 	block := append([]string(nil), lines[sectionStart:sectionEnd]...)
-	blockStructural := tomlStructuralLines(block)
 	fields := []managedField{
 		{name: "backend_tools", pattern: backendToolsLine, anyPattern: backendToolsAnyLine, value: "true", state: &state.Features.BackendTools, changed: &result.BackendTools},
 		{name: "web_fetch", pattern: webFetchLine, anyPattern: webFetchAnyLine, value: "true", state: &state.Features.WebFetch, changed: &result.WebFetch},
 	}
-	found := make(map[string]bool, len(fields))
-	for index := 1; index < len(block); index++ {
-		if !blockStructural[index] {
-			continue
-		}
-		bare := strings.TrimRight(block[index], "\r\n")
-		for fieldIndex := range fields {
-			field := &fields[fieldIndex]
-			replacement, matches := replacementForManagedLine(bare, block[index], *field)
-			if !matches {
-				continue
-			}
-			found[field.name] = true
-			if !field.state.Managed {
-				field.state.Managed = true
-				field.state.Present = true
-				field.state.OriginalLine = block[index]
-			}
-			field.state.AppliedValue = managedSemanticValue(field.value)
-			if block[index] != replacement {
-				*field.changed++
-				block[index] = replacement
-			}
-			break
-		}
-	}
-	if hasMissingManagedField(fields, found) && len(block) > 0 && lineEnding(block[0]) == "" {
-		block[0] += ending
-		state.Features.HeaderEndingAdded = true
-	}
-	insertAt := 1
-	for index := range fields {
-		field := &fields[index]
-		if found[field.name] {
-			continue
-		}
-		if !field.state.Managed {
-			*field.state = ManagedLineState{Managed: true, Present: false}
-		}
-		field.state.AppliedValue = managedSemanticValue(field.value)
-		block = append(block, "")
-		copy(block[insertAt+1:], block[insertAt:])
-		block[insertAt] = field.name + " = " + field.value + ending
-		insertAt++
-		*field.changed++
-	}
+	block = rewriteManagedFields(block, 1, fields, ending)
 	updated := make([]string, 0, len(lines)+len(block)-(sectionEnd-sectionStart))
 	updated = append(updated, lines[:sectionStart]...)
 	updated = append(updated, block...)
@@ -629,15 +716,6 @@ func replacementForManagedLine(bare, original string, field managedField) (strin
 	return "", false
 }
 
-func hasMissingManagedField(fields []managedField, found map[string]bool) bool {
-	for _, field := range fields {
-		if !found[field.name] {
-			return true
-		}
-	}
-	return false
-}
-
 func rewriteModelBlock(block []string, id string, target Target, state *State, ending string, result *ApplyResult) ([]string, error) {
 	proxyURL, err := ToChannelProxyURL(id)
 	if err != nil {
@@ -655,9 +733,18 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 		managedField{name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine, value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch},
 	)
 
+	block = rewriteManagedFields(block, 1, fields, ending)
+	state.Models[id] = modelState
+	return block, nil
+}
+
+// rewriteManagedFields updates existing managed values in place and appends
+// missing values after the table's last field, before trailing comments and
+// blank lines. firstContent is 1 for a named table and 0 for the root table.
+func rewriteManagedFields(block []string, firstContent int, fields []managedField, ending string) []string {
 	found := make(map[string]bool, len(fields))
 	structural := tomlStructuralLines(block)
-	for index := 1; index < len(block); index++ {
+	for index := firstContent; index < len(block); index++ {
 		if !structural[index] {
 			continue
 		}
@@ -682,38 +769,28 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 			break
 		}
 	}
-	if hasMissingManagedField(fields, found) && len(block) > 0 && lineEnding(block[0]) == "" {
-		block[0] += ending
-		modelState.HeaderEndingAdded = true
-	}
 
-	insertAt := 1
+	insertAt := managedFieldFooterInsertAt(block, firstContent)
 	for index := range fields {
 		field := &fields[index]
-		if field.name == "supports_backend_search" || found[field.name] {
+		if found[field.name] {
 			continue
 		}
 		if !field.state.Managed {
 			*field.state = ManagedLineState{Managed: true, Present: false}
 		}
 		field.state.AppliedValue = managedSemanticValue(field.value)
-		line := field.name + " = " + field.value + ending
-		block = insertBlockLine(block, insertAt, line)
+		if insertAt > 0 && lineEnding(block[insertAt-1]) == "" {
+			if field.state.PreviousLineHash == "" {
+				field.state.PreviousLineHash = lineFingerprint(block[insertAt-1])
+			}
+			block[insertAt-1] += ending
+		}
+		block = insertBlockLine(block, insertAt, field.name+" = "+field.value+ending)
 		insertAt++
 		*field.changed++
 	}
-	if !found["supports_backend_search"] {
-		field := &fields[len(fields)-1]
-		if !field.state.Managed {
-			*field.state = ManagedLineState{Managed: true, Present: false}
-		}
-		field.state.AppliedValue = managedSemanticValue(field.value)
-		line := field.name + " = " + field.value + ending
-		block = insertBlockLine(block, modelFieldFooterInsertAt(block), line)
-		*field.changed++
-	}
-	state.Models[id] = modelState
-	return block, nil
+	return block
 }
 
 func insertBlockLine(block []string, index int, line string) []string {
@@ -723,23 +800,18 @@ func insertBlockLine(block []string, index int, line string) []string {
 	return block
 }
 
-func modelFieldFooterInsertAt(block []string) int {
-	insertAt := 1
+func managedFieldFooterInsertAt(block []string, firstContent int) int {
+	insertAt := len(block)
 	structural := tomlStructuralLines(block)
-	for index := 1; index < len(block); index++ {
+	for insertAt > firstContent {
+		index := insertAt - 1
 		if !structural[index] {
-			continue
+			break
 		}
 		bare := strings.TrimSpace(strings.TrimRight(block[index], "\r\n"))
-		if bare == "" || strings.HasPrefix(bare, "#") {
-			continue
+		if bare != "" && !strings.HasPrefix(bare, "#") {
+			break
 		}
-		insertAt = index + 1
-	}
-	// Inserting after a final line without an ending would require changing that
-	// user-owned line. Keep byte-exact restoration by placing the managed field
-	// immediately before that rare final line instead.
-	if insertAt > 1 && lineEnding(block[insertAt-1]) == "" {
 		insertAt--
 	}
 	return insertAt
@@ -807,7 +879,7 @@ func Restore(configPath, statePath string) (int, error) {
 		}
 		block := append([]string(nil), lines[i:end]...)
 		if modelState, ok := state.Models[id]; ok {
-			block, restored = restoreModelBlock(block, modelState, restored)
+			block, restored = restoreModelBlock(block, modelState, restored, end == len(lines))
 		}
 		out = append(out, block...)
 		i = end
@@ -1065,8 +1137,8 @@ func restoreFeatureFlags(text string, state FeatureState) (string, int) {
 		}
 		block = next
 	}
-	if state.HeaderEndingAdded && len(block) == 1 {
-		block[0] = strings.TrimSuffix(block[0], lineEnding(block[0]))
+	if sectionEnd == len(lines) {
+		restoreTerminalBlockEnding(block, state.BackendTools, state.WebFetch)
 	}
 	removeCreatedSection := state.SectionCreated && featureSectionHasNoContent(block)
 	updated := make([]string, 0, len(lines))
@@ -1103,6 +1175,7 @@ func restoreSubagentEnabled(text string, state SubagentState) (string, int) {
 			}
 			updated = append(updated, line)
 		}
+		restoreTerminalBlockEnding(updated, state.Enabled)
 		return strings.Join(updated, ""), restored
 	}
 
@@ -1154,8 +1227,8 @@ func restoreSubagentEnabled(text string, state SubagentState) (string, int) {
 		}
 		block = next
 	}
-	if state.HeaderEndingAdded && len(block) == 1 {
-		block[0] = strings.TrimSuffix(block[0], lineEnding(block[0]))
+	if sectionEnd == len(lines) {
+		restoreTerminalBlockEnding(block, state.Enabled)
 	}
 	removeCreatedSection := state.SectionCreated && featureSectionHasNoContent(block)
 	updated := make([]string, 0, len(lines))
@@ -1182,7 +1255,7 @@ func featureSectionHasNoContent(block []string) bool {
 	return true
 }
 
-func restoreModelBlock(block []string, modelState ModelState, restored int) ([]string, int) {
+func restoreModelBlock(block []string, modelState ModelState, restored int, finalBlock bool) ([]string, int) {
 	fields := []struct {
 		pattern    *regexp.Regexp
 		anyPattern *regexp.Regexp
@@ -1218,10 +1291,32 @@ func restoreModelBlock(block []string, modelState ModelState, restored int) ([]s
 		}
 		block = next
 	}
-	if modelState.HeaderEndingAdded && len(block) == 1 {
-		block[0] = strings.TrimSuffix(block[0], lineEnding(block[0]))
+	if finalBlock {
+		restoreTerminalBlockEnding(block, modelState.BaseURL, modelState.APIBaseURL, modelState.APIBackend, modelState.BackendSearch)
 	}
 	return block, restored
+}
+
+func restoreTerminalBlockEnding(lines []string, states ...ManagedLineState) {
+	if len(lines) == 0 {
+		return
+	}
+	last := len(lines) - 1
+	ending := lineEnding(lines[last])
+	if ending == "" {
+		return
+	}
+	bare := strings.TrimSuffix(lines[last], ending)
+	for _, state := range states {
+		if state.PreviousLineHash != "" && lineFingerprint(bare) == state.PreviousLineHash {
+			lines[last] = bare
+			return
+		}
+	}
+}
+
+func lineFingerprint(line string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(line)))
 }
 
 type tomlStringMode uint8

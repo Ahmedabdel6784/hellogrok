@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"github.com/hellowind777/hellogrok/internal/cfgpatch"
 	"github.com/hellowind777/hellogrok/internal/config"
 	"github.com/hellowind777/hellogrok/internal/console"
+	"github.com/hellowind777/hellogrok/internal/dialog"
 	"github.com/hellowind777/hellogrok/internal/logui"
 	"github.com/hellowind777/hellogrok/internal/logview"
 	"github.com/hellowind777/hellogrok/internal/openpath"
@@ -52,6 +54,20 @@ func main() {
 	if len(os.Args) == 1 && !hasDefaultUI {
 		runDefault(nil, nil)
 		return
+	}
+	if len(os.Args) == 1 {
+		release, alreadyRunning, err := acquireDefaultInstance(dataDir)
+		if err != nil {
+			message := "无法确认 hellogrok 是否已在运行：\n" + err.Error()
+			fmt.Fprintln(os.Stderr, message)
+			dialog.Info("hellogrok 启动失败", message)
+			return
+		}
+		if alreadyRunning {
+			fmt.Fprintln(os.Stderr, "hellogrok is already running")
+			return
+		}
+		defer release()
 	}
 
 	cli := len(os.Args) > 1
@@ -113,14 +129,19 @@ func runDefaultWithSignals(app *App, logger *log.Logger) {
 	done := make(chan struct{})
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		select {
-		case sig := <-sigc:
-			logger.Printf("signal %s received; restoring config and stopping", sig)
-			if err := app.Stop(); err != nil {
-				logger.Printf("signal stop failed: %v", err)
+		for {
+			select {
+			case sig := <-sigc:
+				logger.Printf("signal %s received; restoring config and stopping", sig)
+				if err := app.Stop(); err != nil {
+					logger.Printf("signal stop deferred: %v", err)
+					continue
+				}
+				requestDefaultExit()
+				return
+			case <-done:
+				return
 			}
-			requestDefaultExit()
-		case <-done:
 		}
 	}()
 	runDefault(app, logger)
@@ -217,10 +238,16 @@ func runForeground(app *App, logger *log.Logger) error {
 	// SIGINT/SIGTERM must restore base_url (no orphaned proxy URLs).
 	sigc := make(chan os.Signal, 2)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-	<-sigc
-	signal.Stop(sigc)
-	logger.Printf("signal received; restoring config and stopping")
-	return app.Stop()
+	defer signal.Stop(sigc)
+	for {
+		<-sigc
+		logger.Printf("signal received; restoring config and stopping")
+		if err := app.Stop(); err != nil {
+			logger.Printf("stop deferred; resolve the configuration conflict and signal again: %v", err)
+			continue
+		}
+		return nil
+	}
 }
 
 func runAutostartCommand(args []string) {
@@ -274,11 +301,12 @@ func printUsage(w io.Writer) {
 
 // App implements tray.Controller.
 type App struct {
-	logger  *log.Logger
-	logFile *os.File
-	dataDir string
-	logPath string
-	server  *proxy.Server
+	logger                   *log.Logger
+	logFile                  *os.File
+	dataDir                  string
+	logPath                  string
+	server                   *proxy.Server
+	detectSearchCapabilities func(context.Context, []config.Route, string, bool) map[string]proxy.SearchCapabilities
 
 	mu         sync.Mutex
 	running    bool
@@ -327,7 +355,7 @@ func (a *App) StatusDetail() string {
 			"· 记忆代理启用状态；下次打开托盘时自动恢复\n" +
 			"· 校验并临时补全全部显式自定义模型的代理必需字段\n" +
 			"· 管理 base_url/api_base_url、api_backend 和有效 supports_backend_search\n" +
-			"· true 使用当前渠道 hosted search；false/缺省使用 Build 客户端搜索模型\n" +
+			"· 显式搜索模型优先；否则 true 使用 hosted、false 使用客户端搜索、缺省 Grok 中转自动检测\n" +
 			"· 管理 [features].backend_tools 和 web_fetch 开关\n" +
 			"· 已配置子代理但缺省 enabled 时临时启用；显式 false 保持不变\n" +
 			"· 自动适配 Responses、Anthropic Messages 和 Chat Completions 搜索字段\n" +
@@ -341,11 +369,16 @@ func (a *App) StatusDetail() string {
 	if len(patched) > 0 {
 		list = strings.Join(patched, ", ")
 	}
+	warning := ""
+	if a.lastError != "" {
+		warning = "· 当前警告: " + a.lastError + "\n"
+	}
 	return "运行中（逐渠道 Responses 外观层 + 搜索能力分流 + 响应补字段）。\n" +
+		warning +
 		"· 本地: http://" + a.server.PathAddr + "/c/<渠道>/responses\n" +
 		"· 上游保留原 base_url/api_base_url 路径前缀\n" +
-		"· supports_backend_search=true: 当前渠道 hosted search\n" +
-		"· supports_backend_search=false/缺省: 优先 [models].web_search，否则仅在有效 xAI 登录/API 凭据下使用官方默认搜索模型\n" +
+		"· 搜索分流: 显式 [models].web_search 优先；否则 true 使用 hosted、false 使用客户端搜索\n" +
+		"· 缺省 Grok 中转: 自动检测 hosted 能力；未确认时保留有效 xAI 凭据的官方搜索回退\n" +
 		"· 抓取模式: Build 本地 web_fetch（不依赖独立搜索模型）\n" +
 		"· 子代理: 缺省 enabled 已按 Build 预期临时修复，停止时精确恢复\n" +
 		"· 协议: Responses web_search / Messages server tool / Chat 按模型适配搜索字段\n" +
@@ -386,6 +419,12 @@ func (a *App) Start() error {
 	}
 	a.resetSessionLog()
 
+	if takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath); err != nil {
+		return a.abortStart(fmt.Errorf("inspect config ownership before start: %w", err))
+	} else if takeover.Active() {
+		return a.abortStart(ccSwitchConflictError(takeover, "启动 hellogrok"))
+	}
+
 	// Orphan recovery: a previous unclean exit may leave proxy URLs in config.
 	// Recovery must succeed before loading routes or applying new changes.
 	a.cfgMu.Lock()
@@ -415,6 +454,16 @@ func (a *App) Start() error {
 	if len(routes) == 0 {
 		return a.abortStart(fmt.Errorf("no explicit custom model endpoints found"))
 	}
+	searchSelection, err := config.LoadWebSearchSelection(cfgPath)
+	if err != nil {
+		return a.abortStart(fmt.Errorf("load web search model: %w", err))
+	}
+	routes = a.resolveSearchRoutes(context.Background(), routes, searchSelection)
+	if takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath); err != nil {
+		return a.abortStart(fmt.Errorf("recheck config ownership before rewrite: %w", err))
+	} else if takeover.Active() {
+		return a.abortStart(ccSwitchConflictError(takeover, "启动 hellogrok"))
+	}
 	a.server.SetRoutes(routes)
 	if err := a.server.ServePath(); err != nil {
 		return a.abortStart(fmt.Errorf("start local facade: %w", err))
@@ -424,15 +473,23 @@ func (a *App) Start() error {
 	// Rewrite every explicit endpoint before Grok can load a direct URL. Waiting
 	// for session discovery races the first request after a model switch.
 	a.cfgMu.Lock()
+	effectiveRoutes := make(map[string]config.Route, len(routes))
+	for _, route := range routes {
+		effectiveRoutes[route.ChannelID] = route
+	}
 	targets := make([]cfgpatch.Target, 0, len(models))
 	for _, model := range models {
 		if strings.TrimSpace(model.BaseURL) == "" && strings.TrimSpace(model.APIBaseURL) == "" {
 			continue
 		}
+		route, ok := effectiveRoutes[model.ID]
+		if !ok {
+			continue
+		}
 		targets = append(targets, cfgpatch.Target{
 			ID:                    model.ID,
 			APIBaseURL:            strings.TrimSpace(model.APIBaseURL) != "",
-			SupportsBackendSearch: model.SupportsBackendSearch,
+			SupportsBackendSearch: route.SupportsBackendSearch,
 		})
 	}
 	res, err := cfgpatch.ApplyTargets(cfgPath, stPath, targets)
@@ -453,34 +510,117 @@ func (a *App) Start() error {
 	a.logger.Printf("config rewrite all: base=%d api_base=%d api_backend=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
 		res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
 	a.logger.Printf("config validation passed: backend_tools=true web_fetch=true backend_search=materialized subagent_defaults=repaired-if-needed responses_targets=%d", res.ValidatedTargets)
-	for _, model := range models {
-		if strings.TrimSpace(model.BaseURL) == "" {
-			continue
-		}
-		backend := strings.TrimSpace(model.APIBackend)
-		if backend == "" {
-			backend = "chat_completions"
-		}
+	for _, route := range routes {
+		backend := strings.TrimSpace(route.APIBackend)
 		switch backend {
 		case "responses":
-			a.logger.Printf("channel facade: model=%s upstream=responses canonical Responses passthrough", model.ID)
+			a.logger.Printf("channel facade: model=%s upstream=responses canonical Responses passthrough", route.ChannelID)
 		case "messages":
-			a.logger.Printf("channel facade: model=%s upstream=messages bidirectional Responses conversion", model.ID)
+			a.logger.Printf("channel facade: model=%s upstream=messages bidirectional Responses conversion", route.ChannelID)
 		case "chat_completions":
-			a.logger.Printf("channel facade: model=%s upstream=chat_completions bidirectional Responses conversion", model.ID)
+			a.logger.Printf("channel facade: model=%s upstream=chat_completions bidirectional Responses conversion", route.ChannelID)
 		default:
-			a.logger.Printf("search adapter unavailable: model=%s api_backend=%s", model.ID, backend)
+			a.logger.Printf("search adapter unavailable: model=%s api_backend=%s", route.ChannelID, backend)
 		}
-		if model.SupportsBackendSearch {
-			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel", model.ID)
+		if route.SupportsBackendSearch {
+			if route.HostedSearchKnown {
+				a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel web_search=%t x_search=%t chat_dialect=%s", route.ChannelID, route.HostedWebSearch, route.HostedXSearch, route.HostedChatSearchDialect)
+			} else {
+				a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel capability=explicit", route.ChannelID)
+			}
 		} else {
-			a.logger.Printf("channel search: model=%s supports_backend_search=false mode=client-web_search configured-model-or-authenticated-official-default", model.ID)
+			a.logger.Printf("channel search: model=%s supports_backend_search=false mode=client-web_search configured-model-or-authenticated-official-default", route.ChannelID)
 		}
 	}
 
 	a.running = true
 	a.logger.Printf("started path=%s mode=per-channel-responses-facade+auth-isolate", a.server.PathAddr)
 	return nil
+}
+
+func (a *App) resolveSearchRoutes(
+	ctx context.Context,
+	routes []config.Route,
+	selection config.WebSearchSelection,
+) []config.Route {
+	effective := append([]config.Route(nil), routes...)
+	detect := a.detectSearchCapabilities
+	if detect == nil {
+		detect = a.server.DetectSearchCapabilities
+	}
+
+	if selection.Explicit {
+		var searchRoutes []config.Route
+		for index := range effective {
+			effective[index].SupportsBackendSearch = false
+			effective[index].HostedSearchKnown = true
+			effective[index].HostedWebSearch = false
+			effective[index].HostedXSearch = false
+			if effective[index].ChannelID == selection.Model {
+				searchRoutes = append(searchRoutes, routes[index])
+			}
+		}
+		a.logger.Printf("search routing: explicit client model=%q source=%s; conversation channels forced supports_backend_search=false", selection.Model, selection.Source)
+		if len(searchRoutes) > 0 {
+			reports := detect(ctx, searchRoutes, proxy.SearchCapabilityCachePath(a.dataDir), false)
+			for index := range effective {
+				route := &effective[index]
+				if route.ChannelID != selection.Model {
+					continue
+				}
+				capability := reports[route.ChannelID].WebSearch
+				route.HostedChatSearchDialect = capability.ChatDialect
+				a.logger.Printf("search model validation: model=%s web_search=%s source=%s chat_dialect=%s", route.ChannelID, capability.State, capability.Source, capability.ChatDialect)
+			}
+		} else if selection.Model != "" {
+			a.logger.Printf("search model validation: model=%s is not a proxied custom route; Build will resolve it directly", selection.Model)
+		} else {
+			a.logger.Printf("search model validation: explicit empty model disables a usable custom client-search route")
+		}
+		return effective
+	}
+
+	var candidates []config.Route
+	for index := range effective {
+		route := &effective[index]
+		if route.BackendSearchSet {
+			if !route.SupportsBackendSearch {
+				route.HostedSearchKnown = true
+				route.HostedWebSearch = false
+				route.HostedXSearch = false
+			}
+			continue
+		}
+		route.SupportsBackendSearch = false
+		route.HostedSearchKnown = true
+		route.HostedWebSearch = false
+		route.HostedXSearch = false
+		if proxy.RouteLooksLikeGrok(*route) {
+			candidates = append(candidates, routes[index])
+		}
+	}
+	if len(candidates) == 0 {
+		return effective
+	}
+
+	reports := detect(ctx, candidates, proxy.SearchCapabilityCachePath(a.dataDir), true)
+	for index := range effective {
+		route := &effective[index]
+		if route.BackendSearchSet || !proxy.RouteLooksLikeGrok(*route) {
+			continue
+		}
+		report := reports[route.ChannelID]
+		route.HostedWebSearch = report.WebSearch.State == proxy.CapabilitySupported
+		route.HostedXSearch = report.XSearch.State == proxy.CapabilitySupported
+		route.HostedChatSearchDialect = report.WebSearch.ChatDialect
+		route.SupportsBackendSearch = route.HostedWebSearch || route.HostedXSearch
+		a.logger.Printf("search capability: model=%s effective_backend_search=%t web_search=%s(%s) x_search=%s(%s) chat_dialect=%s",
+			route.ChannelID, route.SupportsBackendSearch,
+			report.WebSearch.State, report.WebSearch.Source,
+			report.XSearch.State, report.XSearch.Source,
+			report.WebSearch.ChatDialect)
+	}
+	return effective
 }
 
 func (a *App) abortStart(err error) error {
@@ -492,28 +632,71 @@ func (a *App) abortStart(err error) error {
 
 func (a *App) Stop() error {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if !a.running {
-		a.mu.Unlock()
 		return nil
 	}
-	a.server.Stop()
-	a.server = proxy.New(a.logger)
 
+	cfgPath := config.ConfigPath()
 	stPath := cfgpatch.StatePath(a.dataDir)
 	a.cfgMu.Lock()
-	n, err := cfgpatch.Restore(config.ConfigPath(), stPath)
+	takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath)
+	if err == nil && takeover.Active() {
+		err = ccSwitchConflictError(takeover, "停止 hellogrok")
+	}
+	if err != nil {
+		a.cfgMu.Unlock()
+		a.lastError = err.Error()
+		a.logger.Printf("stop deferred while config has another owner: %v", err)
+		return err
+	}
+
+	n, err := cfgpatch.Restore(cfgPath, stPath)
+	relinquished := false
+	if err != nil {
+		restoreErr := err
+		// A provider manager may replace the whole live config while hellogrok is
+		// running. If none of our local URLs survived, preserve that external
+		// configuration and discard only the obsolete recovery transaction.
+		var relinquishErr error
+		relinquished, relinquishErr = cfgpatch.Relinquish(cfgPath, stPath)
+		switch {
+		case relinquishErr != nil:
+			err = fmt.Errorf("%w; inspect remaining hellogrok routes: %v", restoreErr, relinquishErr)
+		case !relinquished:
+			err = restoreErr
+		default:
+			err = nil
+		}
+	}
 	a.cfgMu.Unlock()
 	if err != nil {
-		a.logger.Printf("config restore failed: %v", err)
+		a.lastError = err.Error()
+		a.logger.Printf("config restore deferred; proxy remains active: %v", err)
+		return err
+	}
+	if relinquished {
+		a.logger.Printf("config ownership changed externally; no hellogrok routes remain, recovery state relinquished")
 	} else {
 		a.logger.Printf("config restore: %d proxy-managed setting(s) restored", n)
 	}
 
+	a.server.Stop()
+	a.server = proxy.New(a.logger)
 	a.running = false
 	a.patchedIDs = nil
+	a.lastError = ""
 	a.logger.Printf("stopped")
-	a.mu.Unlock()
-	return err
+	return nil
+}
+
+func ccSwitchConflictError(takeover cfgpatch.CCSwitchTakeover, action string) error {
+	return fmt.Errorf(
+		"检测到 CC Switch 正在接管 Grok Build（模型 %q，地址 %s）；两个工具会同时改写 config.toml。请先在 CC Switch 中关闭 Grok Build 的代理接管，再%s",
+		takeover.ModelID,
+		takeover.BaseURL,
+		action,
+	)
 }
 
 func (a *App) IsAutostart() bool         { return autostart.Enabled() }

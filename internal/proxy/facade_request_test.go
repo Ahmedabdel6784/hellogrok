@@ -84,6 +84,54 @@ func TestFacadeUsesProviderSpecificHostedSearchDialect(t *testing.T) {
 	}
 }
 
+func TestFacadeFiltersHostedSearchToDetectedCapabilities(t *testing.T) {
+	tests := []struct {
+		name         string
+		web          bool
+		x            bool
+		wantWeb      int
+		wantX        int
+		wantFunction int
+	}{
+		{name: "web only", web: true, wantWeb: 1},
+		{name: "x only", x: true, wantX: 1},
+		{name: "both", web: true, x: true, wantWeb: 1, wantX: 1},
+		{name: "none preserves ordinary search function", wantFunction: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			route := config.Route{
+				ChannelID:             "grok-relay",
+				APIBackend:            "responses",
+				WireModel:             "grok-4.5",
+				SupportsBackendSearch: test.web || test.x,
+				HostedSearchKnown:     true,
+				HostedWebSearch:       test.web,
+				HostedXSearch:         test.x,
+			}
+			request, err := adaptFacadeRequest([]byte(`{
+				"input":"search",
+				"tools":[
+					{"type":"function","name":"web_search","parameters":{}},
+					{"type":"function","name":"save","parameters":{}},
+					{"type":"web_search"},
+					{"type":"x_search"}
+				]
+			}`), route, newSearchReplayCache())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, hosted, functionSearch, xSearch := summarizeBody(request.Body)
+			if hosted != test.wantWeb || xSearch != test.wantX || functionSearch != test.wantFunction {
+				t.Fatalf("hosted=%d function=%d x=%d body=%s", hosted, functionSearch, xSearch, request.Body)
+			}
+			if !strings.Contains(string(request.Body), `"save"`) {
+				t.Fatalf("unrelated function was removed: %s", request.Body)
+			}
+		})
+	}
+}
+
 func TestFacadePreservesClientSearchOnEveryUpstreamProtocol(t *testing.T) {
 	body := []byte(`{
 		"input":"search then fetch",
@@ -442,10 +490,11 @@ func TestFacadePreparesBuildClientSearchExecution(t *testing.T) {
 		"max_output_tokens":8192,
 		"tools":[{"type":"web_search","filters":{"allowed_domains":["github.com"]}}]
 	}`), config.Route{
-		ChannelID:             "deepseek-v4-flash",
-		APIBackend:            "responses",
-		WireModel:             "deepseek-v4-flash",
-		SupportsBackendSearch: true,
+		ChannelID:         "deepseek-v4-flash",
+		APIBackend:        "responses",
+		WireModel:         "deepseek-v4-flash",
+		HostedSearchKnown: true,
+		HostedXSearch:     true,
 	}, newSearchReplayCache())
 	if err != nil {
 		t.Fatal(err)
@@ -463,6 +512,10 @@ func TestFacadePreparesBuildClientSearchExecution(t *testing.T) {
 	choice, _ := root["tool_choice"].(map[string]any)
 	if stringValue(choice["type"]) != "web_search" {
 		t.Fatalf("hosted search was not selected: %#v", root["tool_choice"])
+	}
+	_, _, hosted, function, xSearch := summarizeBody(request.Body)
+	if hosted != 1 || function != 0 || xSearch != 0 {
+		t.Fatalf("client-search execution gained the conversation x_search policy: %s", request.Body)
 	}
 }
 
@@ -516,15 +569,14 @@ func TestFacadeDoesNotInventSearchForDisabledRoute(t *testing.T) {
 	}
 }
 
-func TestFacadeNormalizesExistingHostedSearchWhenBackendSearchIsDisabled(t *testing.T) {
+func TestFacadeDropsUnrecognizedHostedSearchWhenBackendSearchIsDisabled(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		model       string
-		body        string
-		wantXSearch int
+		name  string
+		model string
+		body  string
 	}{
-		{name: "generic hosted request", model: "gpt-search", body: `{"input":"search","tools":[{"type":"web_search"}]}`},
-		{name: "Grok x-search request", model: "grok-4.5", body: `{"input":"search","tools":[{"type":"x_search"}]}`, wantXSearch: 1},
+		{name: "generic hosted request", model: "gpt-search", body: `{"input":"search","tools":[{"type":"function","name":"web_fetch","parameters":{}},{"type":"web_search"}],"tool_choice":{"type":"web_search"}}`},
+		{name: "Grok x-search request", model: "grok-4.5", body: `{"input":"search","tools":[{"type":"function","name":"web_fetch","parameters":{}},{"type":"x_search"}],"tool_choice":{"type":"x_search"}}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			request, err := adaptFacadeRequest([]byte(test.body), config.Route{
@@ -536,8 +588,15 @@ func TestFacadeNormalizesExistingHostedSearchWhenBackendSearchIsDisabled(t *test
 				t.Fatal(err)
 			}
 			_, _, hosted, function, xSearch := summarizeBody(request.Body)
-			if !request.HostedWebSearch || request.ProxyAddedWebSearch || hosted != 1 || function != 0 || xSearch != test.wantXSearch {
-				t.Fatalf("existing hosted request was not normalized: request=%+v body=%s", request, request.Body)
+			if request.HostedWebSearch || request.ProxyAddedWebSearch || hosted != 0 || function != 0 || xSearch != 0 {
+				t.Fatalf("disabled route retained a hosted search declaration: request=%+v body=%s", request, request.Body)
+			}
+			root, err := decodeRequestObject(request.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := root["tool_choice"]; exists || !strings.Contains(string(request.Body), `"web_fetch"`) {
+				t.Fatalf("hosted tool choice was not repaired or web_fetch was lost: %s", request.Body)
 			}
 		})
 	}
@@ -774,5 +833,32 @@ func TestChatHostedSearchChoiceKeepsOrdinaryFunctions(t *testing.T) {
 	}
 	if _, exists := converted["tool_choice"]; exists {
 		t.Fatalf("hosted choice leaked as an invalid Chat function choice: %#v", converted)
+	}
+}
+
+func TestChatHostedSearchUsesDetectedWebSearchOptionsDialect(t *testing.T) {
+	root, err := decodeRequestObject([]byte(`{
+		"model":"grok-real",
+		"input":"search now",
+		"tools":[{"type":"web_search"}],
+		"tool_choice":"required"
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	converted, err := responsesToChatRequest(root, config.Route{
+		ChannelID:               "grok2api-chat",
+		WireModel:               "grok-real",
+		Host:                    "relay.test",
+		HostedChatSearchDialect: config.ChatSearchDialectWebSearchOptions,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := converted["web_search_options"]; !exists {
+		t.Fatalf("detected web_search_options dialect was not used: %#v", converted)
+	}
+	if _, exists := converted["search_parameters"]; exists {
+		t.Fatalf("both Chat search dialects were sent: %#v", converted)
 	}
 }

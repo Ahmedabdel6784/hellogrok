@@ -32,6 +32,84 @@ func TestChannelProxyURLRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDetectCCSwitchTakeoverRequiresMarkerAndGrokLoopbackRoute(t *testing.T) {
+	tests := []struct {
+		name   string
+		config string
+		active bool
+		model  string
+	}{
+		{
+			name: "default port",
+			config: "[models]\ndefault = \"grok\"\n\n[model.grok]\n" +
+				"base_url = \"http://127.0.0.1:15721/grokbuild/v1\"\n" +
+				"api_key = \"PROXY_MANAGED\"\napi_backend = \"responses\"\n",
+			active: true,
+			model:  "grok",
+		},
+		{
+			name: "custom address port and non-default scan",
+			config: "[models]\ndefault = \"other\"\n\n[model.other]\nbase_url = \"https://example.test/v1\"\n\n" +
+				"[model.managed]\nbase_url = \"http://192.168.50.10:24567/grokbuild/v1/\"\napi_key = \"PROXY_MANAGED\"\n",
+			active: true,
+			model:  "managed",
+		},
+		{
+			name:   "marker without route",
+			config: "[model.grok]\nbase_url = \"https://example.test/grokbuild/v1\"\napi_key = \"PROXY_MANAGED\"\n",
+		},
+		{
+			name:   "route without marker",
+			config: "[model.grok]\nbase_url = \"http://127.0.0.1:15721/grokbuild/v1\"\napi_key = \"user-key\"\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(test.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			takeover, err := DetectCCSwitchTakeover(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if takeover.Active() != test.active || takeover.ModelID != test.model {
+				t.Fatalf("takeover = %+v, active=%t model=%q", takeover, test.active, test.model)
+			}
+		})
+	}
+}
+
+func TestRelinquishRequiresAllHellogrokReferencesToBeGone(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(statePath, []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withProxy := "[model.one]\nbase_url = \"http://127.0.0.1:18787/c/one\"\n"
+	if err := os.WriteFile(configPath, []byte(withProxy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if relinquished, err := Relinquish(configPath, statePath); err != nil || relinquished {
+		t.Fatalf("relinquish with active route = %t, err=%v", relinquished, err)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("state removed while route remained: %v", err)
+	}
+
+	direct := "[model.one]\nbase_url = \"https://new-provider.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(direct), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if relinquished, err := Relinquish(configPath, statePath); err != nil || !relinquished {
+		t.Fatalf("relinquish after provider replacement = %t, err=%v", relinquished, err)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state remains after relinquish: %v", err)
+	}
+}
+
 func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
@@ -80,6 +158,9 @@ func TestApplyTargetsAndRestoreExactConfig(t *testing.T) {
 	}
 	patchedBytes, _ := os.ReadFile(configPath)
 	patched := string(patchedBytes)
+	if got, want := sectionText(t, patched, "models"), sectionText(t, original, "models"); got != want {
+		t.Fatalf("[models] changed while proxy was active\nwant: %q\ngot:  %q", want, got)
+	}
 	for _, want := range []string{
 		`base_url = "http://127.0.0.1:18787/c/chat"`,
 		`api_base_url = "http://127.0.0.1:18787/c/chat"`,
@@ -209,7 +290,7 @@ func TestApplyTargetsRepairsOmittedSubagentEnabledAndRestoresExactly(t *testing.
 			name: "dotted subagent config",
 			original: `subagents.models.general-purpose = "one"` +
 				"\n\n[model.one]\nbase_url = \"https://one.example/v1\"\n",
-			wantFragment: "subagents.enabled = true\nsubagents.models.general-purpose",
+			wantFragment: "subagents.models.general-purpose = \"one\"\nsubagents.enabled = true",
 			wantChanged:  1,
 		},
 		{
@@ -520,6 +601,226 @@ func TestApplyTargetsPlacesBackendSearchAfterChannelConfiguration(t *testing.T) 
 	}
 }
 
+func TestApplyTargetsPreservesExistingOrderAndAppendsMissingFields(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	modelsSection := strings.Join([]string{
+		"[models]",
+		`default = "one"`,
+		`web_search = "deepseek-v4-flash"`,
+		`fallback = "two"`,
+		"# keep models footer",
+		"",
+	}, "\n")
+	original := modelsSection + strings.Join([]string{
+		"[features]",
+		"experimental = true",
+		"web_fetch = false # keep position and comment",
+		"# keep features footer",
+		"",
+		"[subagents]",
+		`model = "one"`,
+		"max_depth = 3",
+		"# keep subagents footer",
+		"",
+		"[model.one]",
+		`model = "wire-model"`,
+		"supports_backend_search = false # keep position and comment",
+		`api_key = "test-key"`,
+		"# keep model footer",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true}}); err != nil {
+		t.Fatal(err)
+	}
+	patchedBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patched := string(patchedBytes)
+	if !strings.HasPrefix(patched, modelsSection) {
+		t.Fatalf("user-owned [models] section moved or changed:\n%s", patched)
+	}
+
+	features := sectionText(t, patched, "features")
+	assertOrdered(t, features,
+		"experimental = true",
+		"web_fetch = true # keep position and comment",
+		"backend_tools = true",
+		"# keep features footer",
+	)
+	subagents := sectionText(t, patched, "subagents")
+	assertOrdered(t, subagents,
+		`model = "one"`,
+		"max_depth = 3",
+		"enabled = true",
+		"# keep subagents footer",
+	)
+	model := sectionText(t, patched, "model.one")
+	assertOrdered(t, model,
+		`model = "wire-model"`,
+		"supports_backend_search = false # keep position and comment",
+		`api_key = "test-key"`,
+		`base_url = "http://127.0.0.1:18787/c/one"`,
+		`api_base_url = "http://127.0.0.1:18787/c/one"`,
+		`api_backend = "responses"`,
+		"# keep model footer",
+	)
+
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestApplyTargetsAppendsEitherMissingFeatureFlagAtFooter(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing string
+		added    string
+	}{
+		{name: "backend tools missing", existing: "web_fetch = true", added: "backend_tools = true"},
+		{name: "web fetch missing", existing: "backend_tools = true", added: "web_fetch = true"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			original := "[features]\nother = true\n" + test.existing + "\n# footer\n\n" +
+				"[model.one]\nbase_url = \"https://one.example/v1\"\n"
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+				t.Fatal(err)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			features := sectionText(t, string(patched), "features")
+			assertOrdered(t, features, "other = true", test.existing, test.added, "# footer")
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			restored, _ := os.ReadFile(configPath)
+			if string(restored) != original {
+				t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+			}
+		})
+	}
+}
+
+func TestApplyTargetsAppendsBelowFinalLineWithoutEndingAndRestoresExactly(t *testing.T) {
+	tests := []struct {
+		name         string
+		original     string
+		wantSequence string
+	}{
+		{
+			name: "model field with LF",
+			original: "[features]\nbackend_tools = true\nweb_fetch = true\n\n" +
+				"[model.one]\nmodel = \"wire-model\"",
+			wantSequence: "model = \"wire-model\"\nbase_url = \"http://127.0.0.1:18787/c/one\"",
+		},
+		{
+			name: "model field with CRLF",
+			original: "[features]\r\nbackend_tools = true\r\nweb_fetch = true\r\n\r\n" +
+				"[model.one]\r\nmodel = \"wire-model\"",
+			wantSequence: "model = \"wire-model\"\r\nbase_url = \"http://127.0.0.1:18787/c/one\"",
+		},
+		{
+			name: "features field",
+			original: "[model.one]\nbase_url = \"http://127.0.0.1:18787/c/one\"\n" +
+				"api_backend = \"responses\"\nsupports_backend_search = false\n\n[features]\nother = true",
+			wantSequence: "other = true\nbackend_tools = true\nweb_fetch = true",
+		},
+		{
+			name: "subagent field",
+			original: "[features]\nbackend_tools = true\nweb_fetch = true\n\n" +
+				"[model.one]\nbase_url = \"http://127.0.0.1:18787/c/one\"\n" +
+				"api_backend = \"responses\"\nsupports_backend_search = false\n\n" +
+				"[subagents]\nmodel = \"one\"",
+			wantSequence: "model = \"one\"\nenabled = true",
+		},
+		{
+			name: "multiline model field",
+			original: "[features]\nbackend_tools = true\nweb_fetch = true\n\n" +
+				"[model.one]\ninstructions = \"\"\"\nkeep this text\n\"\"\"",
+			wantSequence: "\"\"\"\nbase_url = \"http://127.0.0.1:18787/c/one\"",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			if err := os.WriteFile(configPath, []byte(test.original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+				t.Fatal(err)
+			}
+			patched, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(patched), test.wantSequence) {
+				t.Fatalf("new fields were not appended below the final user field:\n%s", patched)
+			}
+			if _, err := Restore(configPath, statePath); err != nil {
+				t.Fatal(err)
+			}
+			restored, _ := os.ReadFile(configPath)
+			if string(restored) != test.original {
+				t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", test.original, restored)
+			}
+		})
+	}
+}
+
+func TestNoEndingRecoveryStateDoesNotCopyUserFieldValue(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	const secret = "must-not-appear-in-recovery-state"
+	original := "[features]\nbackend_tools = true\nweb_fetch = true\n\n" +
+		"[model.one]\napi_key = \"" + secret + "\""
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(state), secret) {
+		t.Fatalf("recovery state copied a user-owned field value: %s", state)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := os.ReadFile(configPath)
+	if string(restored) != original {
+		t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
 func TestApplyTargetsCreatesAndRemovesFeaturesSectionExactly(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
@@ -653,32 +954,36 @@ func TestApplyTargetsRejectsWrongTypedBackendSearchWithoutWriting(t *testing.T) 
 	}
 }
 
-func TestRestoreRejectsLegacyRewriteState(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.toml")
-	statePath := filepath.Join(dir, "state.json")
-	patched := "[model.one]\nsupports_backend_search = true\n"
-	legacyState := `{"version":3,"models":{"one":{"backend_search":{"managed":true,"present":true,"original_line":"supports_backend_search = false\n"}}}}`
-	if err := os.WriteFile(configPath, []byte(patched), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(statePath, []byte(legacyState), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestRestoreRejectsAllOlderRewriteStateVersions(t *testing.T) {
+	for _, version := range []string{"3", "4"} {
+		t.Run("version "+version, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			statePath := filepath.Join(dir, "state.json")
+			patched := "[model.one]\nsupports_backend_search = true\n"
+			legacyState := `{"version":` + version + `,"models":{"one":{"backend_search":{"managed":true,"present":true,"original_line":"supports_backend_search = false\n"}}}}`
+			if err := os.WriteFile(configPath, []byte(patched), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(statePath, []byte(legacyState), 0o600); err != nil {
+				t.Fatal(err)
+			}
 
-	restored, err := Restore(configPath, statePath)
-	if err == nil || !strings.Contains(err.Error(), "unsupported rewrite state version 3") {
-		t.Fatalf("legacy state error = %v", err)
-	}
-	if restored != 0 {
-		t.Fatalf("restored fields = %d, want 0", restored)
-	}
-	current, _ := os.ReadFile(configPath)
-	if string(current) != patched {
-		t.Fatalf("config changed after rejecting legacy state: %q", current)
-	}
-	if _, err := os.Stat(statePath); err != nil {
-		t.Fatalf("legacy state should remain for manual recovery: %v", err)
+			restored, err := Restore(configPath, statePath)
+			if err == nil || !strings.Contains(err.Error(), "unsupported rewrite state version "+version) {
+				t.Fatalf("legacy state error = %v", err)
+			}
+			if restored != 0 {
+				t.Fatalf("restored fields = %d, want 0", restored)
+			}
+			current, _ := os.ReadFile(configPath)
+			if string(current) != patched {
+				t.Fatalf("config changed after rejecting legacy state: %q", current)
+			}
+			if _, err := os.Stat(statePath); err != nil {
+				t.Fatalf("legacy state should remain for manual recovery: %v", err)
+			}
+		})
 	}
 }
 
@@ -868,6 +1173,40 @@ func TestRestorePreservesUnrelatedConcurrentEdit(t *testing.T) {
 	}
 }
 
+func TestRestorePreservesConcurrentEditAfterOriginalFinalLine(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[features]\nbackend_tools = true\nweb_fetch = true\n\n" +
+		"[model.one]\nmodel = \"wire-model\""
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userEdit := "[user_edit]\nvalue = 1\n"
+	if err := os.WriteFile(configPath, append(patched, []byte(userEdit)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := original + "\n" + userEdit
+	if string(current) != want {
+		t.Fatalf("concurrent edit was not preserved\nwant: %q\ngot:  %q", want, current)
+	}
+}
+
 func TestApplyTargetsRestoresSectionsWithoutTrailingNewline(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1008,4 +1347,20 @@ func sectionText(t *testing.T, text, name string) string {
 		end = next + 1
 	}
 	return text[start : start+len(marker)+end]
+}
+
+func assertOrdered(t *testing.T, text string, values ...string) {
+	t.Helper()
+	position := -1
+	for _, value := range values {
+		next := strings.Index(text[position+1:], value)
+		if next < 0 {
+			t.Fatalf("missing %q while checking order:\n%s", value, text)
+		}
+		next += position + 1
+		if next <= position {
+			t.Fatalf("%q is out of order:\n%s", value, text)
+		}
+		position = next
+	}
 }

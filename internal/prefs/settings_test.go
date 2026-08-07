@@ -6,22 +6,22 @@ import (
 	"testing"
 )
 
-func TestProxyEnabledDefaultsFalseAndPersists(t *testing.T) {
+func TestProxyEnabledDefaultsTrueAndPersistsExplicitChoice(t *testing.T) {
 	path := Path(t.TempDir())
-	if enabled, err := ProxyEnabled(path); err != nil || enabled {
-		t.Fatalf("default enabled=%v err=%v", enabled, err)
-	}
-	if err := SetProxyEnabled(path, true); err != nil {
-		t.Fatal(err)
-	}
 	if enabled, err := ProxyEnabled(path); err != nil || !enabled {
-		t.Fatalf("saved true enabled=%v err=%v", enabled, err)
+		t.Fatalf("default enabled=%v err=%v", enabled, err)
 	}
 	if err := SetProxyEnabled(path, false); err != nil {
 		t.Fatal(err)
 	}
 	if enabled, err := ProxyEnabled(path); err != nil || enabled {
 		t.Fatalf("saved false enabled=%v err=%v", enabled, err)
+	}
+	if err := SetProxyEnabled(path, true); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, err := ProxyEnabled(path); err != nil || !enabled {
+		t.Fatalf("saved true enabled=%v err=%v", enabled, err)
 	}
 }
 

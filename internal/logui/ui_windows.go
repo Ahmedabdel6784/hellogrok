@@ -38,6 +38,7 @@ var (
 	pDispatchMessageW = user32.NewProc("DispatchMessageW")
 	pPostQuitMessage  = user32.NewProc("PostQuitMessage")
 	pLoadCursorW      = user32.NewProc("LoadCursorW")
+	pLoadImageW       = user32.NewProc("LoadImageW")
 	pSendMessageW     = user32.NewProc("SendMessageW")
 	pGetClientRect    = user32.NewProc("GetClientRect")
 	pMoveWindow       = user32.NewProc("MoveWindow")
@@ -79,6 +80,7 @@ const (
 	wmDestroy          = 0x0002
 	wmSize             = 0x0005
 	wmSetFont          = 0x0030
+	wmSetIcon          = 0x0080
 	wmSetText          = 0x000C
 	wmGetTextLength    = 0x000E
 	wmSetSel           = 0x00B1
@@ -90,11 +92,20 @@ const (
 	idcArrow           = 32512
 	colorWindow        = 5
 	defaultGUIFont     = 17
+	imageIcon          = 1
+	iconSmall          = 0
+	iconBig            = 1
+	lrShared           = 0x00008000
+	appIconResourceID  = 1
 	timerID            = 1
 	statusHeight       = 120
 	errClassExists     = 1410
 	smCXScreen         = 0
 	smCYScreen         = 1
+	smCXIcon           = 11
+	smCYIcon           = 12
+	smCXSmallIcon      = 49
+	smCYSmallIcon      = 50
 	// default monitor size: narrower than before
 	defaultWinW                = 720
 	defaultWinH                = 560
@@ -207,6 +218,8 @@ func Open(path string, status StatusFunc) error {
 
 func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 	hInstance, _, _ := pGetModuleHandleW.Call(0)
+	largeIcon := loadWindowIcon(hInstance, smCXIcon, smCYIcon)
+	smallIcon := loadWindowIcon(hInstance, smCXSmallIcon, smCYSmallIcon)
 
 	classOnce.Do(func() {
 		var err error
@@ -220,9 +233,11 @@ func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 			Size:       uint32(unsafe.Sizeof(wndClassEx{})),
 			WndProc:    windowProcCallback,
 			Instance:   hInstance,
+			Icon:       largeIcon,
 			Cursor:     cursor,
 			Background: uintptr(colorWindow + 1),
 			ClassName:  className,
+			IconSm:     smallIcon,
 		}
 		atom, _, callErr := pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 		if atom == 0 && lastErr() != errClassExists {
@@ -250,15 +265,16 @@ func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 		return 0, nil, fmt.Errorf("CreateWindowExW: %v last=%d", callErr, lastErr())
 	}
 	st.hwnd = hwnd
+	pSendMessageW.Call(hwnd, wmSetIcon, iconBig, largeIcon)
+	pSendMessageW.Call(hwnd, wmSetIcon, iconSmall, smallIcon)
 
 	editClass, _ := syscall.UTF16PtrFromString("EDIT")
-	mkEdit := func() (uintptr, error) {
+	mkEdit := func(wrap bool) (uintptr, error) {
 		h, _, e := pCreateWindowExW.Call(
 			0,
 			uintptr(unsafe.Pointer(editClass)),
 			0,
-			wsChild|wsVisible|wsVScroll|wsHScroll|wsBorder|wsClipSiblings|
-				esMultiline|esReadonly|esAutovscroll|esAutohscroll|esWantreturn,
+			editStyle(wrap),
 			0, 0, 200, 80,
 			hwnd, 0, hInstance, 0,
 		)
@@ -268,11 +284,11 @@ func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 		return h, nil
 	}
 	var err error
-	if st.editSt, err = mkEdit(); err != nil {
+	if st.editSt, err = mkEdit(true); err != nil {
 		pDestroyWindow.Call(hwnd)
 		return 0, nil, err
 	}
-	if st.editLg, err = mkEdit(); err != nil {
+	if st.editLg, err = mkEdit(false); err != nil {
 		pDestroyWindow.Call(hwnd)
 		return 0, nil, err
 	}
@@ -297,6 +313,29 @@ func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 	pSetForeground.Call(hwnd)
 	pSetTimer.Call(hwnd, timerID, 400, 0)
 	return hwnd, st, nil
+}
+
+func loadWindowIcon(hInstance uintptr, widthMetric, heightMetric int) uintptr {
+	width, _, _ := pGetSystemMetrics.Call(uintptr(widthMetric))
+	height, _, _ := pGetSystemMetrics.Call(uintptr(heightMetric))
+	icon, _, _ := pLoadImageW.Call(
+		hInstance,
+		appIconResourceID,
+		imageIcon,
+		width,
+		height,
+		lrShared,
+	)
+	return icon
+}
+
+func editStyle(wrap bool) uintptr {
+	style := uintptr(wsChild | wsVisible | wsVScroll | wsBorder | wsClipSiblings |
+		esMultiline | esReadonly | esAutovscroll | esWantreturn)
+	if !wrap {
+		style |= wsHScroll | esAutohscroll
+	}
+	return style
 }
 
 func pump(hwnd uintptr, st *winState) {

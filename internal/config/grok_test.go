@@ -284,6 +284,9 @@ base_url = "https://plain.example/v1"
 	if !byModel["inherited"].SupportsBackendSearch {
 		t.Fatal("provider backend-search capability was not inherited")
 	}
+	if !byModel["inherited"].BackendSearchSet || !byModel["disabled"].BackendSearchSet || byModel["default-disabled"].BackendSearchSet {
+		t.Fatalf("explicit and missing backend-search declarations were collapsed: %#v", byModel)
+	}
 	if byModel["disabled"].SupportsBackendSearch || byModel["default-disabled"].SupportsBackendSearch {
 		t.Fatalf("false or missing capability became enabled: %#v", byModel)
 	}
@@ -298,6 +301,68 @@ base_url = "https://plain.example/v1"
 	}
 	if !byRoute["inherited"].SupportsBackendSearch || byRoute["disabled"].SupportsBackendSearch || byRoute["default-disabled"].SupportsBackendSearch {
 		t.Fatalf("route capabilities do not match config: %#v", byRoute)
+	}
+	if !byRoute["inherited"].BackendSearchSet || !byRoute["disabled"].BackendSearchSet || byRoute["default-disabled"].BackendSearchSet {
+		t.Fatalf("route declaration presence was not preserved: %#v", byRoute)
+	}
+}
+
+func TestLoadWebSearchSelectionUsesEnvironmentThenConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte("[models]\nweb_search = \"configured-search\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GROK_WEB_SEARCH_MODEL", " environment-search ")
+	selection, err := LoadWebSearchSelection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selection.Explicit || selection.Model != "environment-search" || selection.Source != "environment" {
+		t.Fatalf("environment selection = %+v", selection)
+	}
+
+	t.Setenv("GROK_WEB_SEARCH_MODEL", "  ")
+	selection, err = LoadWebSearchSelection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selection.Explicit || selection.Model != "configured-search" || selection.Source != "config" {
+		t.Fatalf("config selection = %+v", selection)
+	}
+
+	if err := os.WriteFile(path, []byte("[models]\ndefault = \"one\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selection, err = LoadWebSearchSelection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Explicit || selection.Model != "" || selection.Source != "" {
+		t.Fatalf("missing selection = %+v", selection)
+	}
+}
+
+func TestLoadWebSearchSelectionPreservesExplicitEmptyAndRejectsWrongType(t *testing.T) {
+	t.Setenv("GROK_WEB_SEARCH_MODEL", "")
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[models]\nweb_search = \"   \"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selection, err := LoadWebSearchSelection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selection.Explicit || selection.Model != "" || selection.Source != "config" {
+		t.Fatalf("explicit empty selection = %+v", selection)
+	}
+
+	if err := os.WriteFile(path, []byte("[models]\nweb_search = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadWebSearchSelection(path); err == nil || !strings.Contains(err.Error(), "[models].web_search must be a string") {
+		t.Fatalf("wrong type error = %v", err)
 	}
 }
 
