@@ -10,8 +10,11 @@
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
+[![LINUX DO](https://img.shields.io/badge/LINUX_DO-链接认可-0A84FF?logo=linux&logoColor=white)](https://linux.do)
 
 [English](./README.md) · [简体中文](./README_CN.md) · [Changelog](./CHANGELOG.md)
+
+> 🏅 此项目已链接认可 [LINUX DO](https://linux.do) 社区。
 
 ## 目录
 

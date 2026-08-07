@@ -10,8 +10,11 @@ A cross-platform local proxy that makes Grok Build custom model channels work wi
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
+[![LINUX DO](https://img.shields.io/badge/LINUX_DO-recognized-0A84FF?logo=linux&logoColor=white)](https://linux.do)
 
 [English](./README.md) · [简体中文](./README_CN.md) · [Changelog](./CHANGELOG.md)
+
+> 🏅 This project is linked & recognized by the [LINUX DO](https://linux.do) community.
 
 ## Contents
 
