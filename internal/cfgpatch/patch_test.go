@@ -470,6 +470,56 @@ func TestApplyTargetsMaterializesEffectiveBackendSearchAndRestores(t *testing.T)
 	}
 }
 
+func TestApplyTargetsPlacesBackendSearchAfterChannelConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := strings.Join([]string{
+		"[model.one]",
+		`model = "wire-model"`,
+		`base_url = "https://one.example/v1"`,
+		`api_base_url = "https://one.example/v1"`,
+		`api_backend = "chat_completions"`,
+		`api_key = "test-key"`,
+		"# keep this trailing channel comment",
+		"",
+		"[model.two]",
+		`base_url = "https://two.example/v1"`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one", APIBaseURL: true}}); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	one := string(patched)
+	if end := strings.Index(one, "\n[model.two]"); end >= 0 {
+		one = one[:end]
+	}
+	backend := strings.Index(one, `api_backend = "responses"`)
+	key := strings.Index(one, `api_key = "test-key"`)
+	search := strings.Index(one, "supports_backend_search = false")
+	comment := strings.Index(one, "# keep this trailing channel comment")
+	if backend < 0 || key < 0 || search < 0 || comment < 0 || search < backend || search < key || search > comment {
+		t.Fatalf("backend search was not placed below channel configuration:\n%s", one)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("restore changed original config\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
 func TestApplyTargetsCreatesAndRemovesFeaturesSectionExactly(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")

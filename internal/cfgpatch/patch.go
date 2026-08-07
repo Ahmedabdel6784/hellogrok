@@ -646,12 +646,14 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 	modelState := state.Models[id]
 	fields := []managedField{
 		{name: "base_url", pattern: baseURLLine, anyPattern: baseURLAnyLine, value: quoteTOML(proxyURL), state: &modelState.BaseURL, changed: &result.BaseURLs},
-		{name: "api_backend", pattern: apiBackendLine, anyPattern: apiBackendAnyLine, value: quoteTOML("responses"), state: &modelState.APIBackend, changed: &result.APIBackends},
-		{name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine, value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch},
 	}
 	if target.APIBaseURL {
 		fields = append(fields, managedField{name: "api_base_url", pattern: apiBaseURLLine, anyPattern: apiBaseURLAnyLine, value: quoteTOML(proxyURL), state: &modelState.APIBaseURL, changed: &result.APIBaseURLs})
 	}
+	fields = append(fields,
+		managedField{name: "api_backend", pattern: apiBackendLine, anyPattern: apiBackendAnyLine, value: quoteTOML("responses"), state: &modelState.APIBackend, changed: &result.APIBackends},
+		managedField{name: "supports_backend_search", pattern: backendSearchLine, anyPattern: backendSearchAnyLine, value: fmt.Sprintf("%t", target.SupportsBackendSearch), state: &modelState.BackendSearch, changed: &result.BackendSearch},
+	)
 
 	found := make(map[string]bool, len(fields))
 	structural := tomlStructuralLines(block)
@@ -688,7 +690,7 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 	insertAt := 1
 	for index := range fields {
 		field := &fields[index]
-		if found[field.name] {
+		if field.name == "supports_backend_search" || found[field.name] {
 			continue
 		}
 		if !field.state.Managed {
@@ -696,14 +698,51 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 		}
 		field.state.AppliedValue = managedSemanticValue(field.value)
 		line := field.name + " = " + field.value + ending
-		block = append(block, "")
-		copy(block[insertAt+1:], block[insertAt:])
-		block[insertAt] = line
+		block = insertBlockLine(block, insertAt, line)
 		insertAt++
+		*field.changed++
+	}
+	if !found["supports_backend_search"] {
+		field := &fields[len(fields)-1]
+		if !field.state.Managed {
+			*field.state = ManagedLineState{Managed: true, Present: false}
+		}
+		field.state.AppliedValue = managedSemanticValue(field.value)
+		line := field.name + " = " + field.value + ending
+		block = insertBlockLine(block, modelFieldFooterInsertAt(block), line)
 		*field.changed++
 	}
 	state.Models[id] = modelState
 	return block, nil
+}
+
+func insertBlockLine(block []string, index int, line string) []string {
+	block = append(block, "")
+	copy(block[index+1:], block[index:])
+	block[index] = line
+	return block
+}
+
+func modelFieldFooterInsertAt(block []string) int {
+	insertAt := 1
+	structural := tomlStructuralLines(block)
+	for index := 1; index < len(block); index++ {
+		if !structural[index] {
+			continue
+		}
+		bare := strings.TrimSpace(strings.TrimRight(block[index], "\r\n"))
+		if bare == "" || strings.HasPrefix(bare, "#") {
+			continue
+		}
+		insertAt = index + 1
+	}
+	// Inserting after a final line without an ending would require changing that
+	// user-owned line. Keep byte-exact restoration by placing the managed field
+	// immediately before that rare final line instead.
+	if insertAt > 1 && lineEnding(block[insertAt-1]) == "" {
+		insertAt--
+	}
+	return insertAt
 }
 
 // Restore puts every managed line back exactly as it appeared before startup.
