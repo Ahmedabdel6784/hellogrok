@@ -4,8 +4,6 @@ package tray
 
 import (
 	"log"
-	"strings"
-	"time"
 
 	"github.com/getlantern/systray"
 	"github.com/hellowind777/hellogrok/internal/dialog"
@@ -23,30 +21,6 @@ type Controller interface {
 	StatusText() string
 	StatusDetail() string
 	OpenMonitor() error
-}
-
-type proxyOperation uint8
-
-const (
-	operationIdle proxyOperation = iota
-	operationStarting
-	operationStopping
-)
-
-func operationTitle(operation proxyOperation, dotPhase int) string {
-	if dotPhase < 1 || dotPhase > 3 {
-		dotPhase = 1
-	}
-	label := ""
-	switch operation {
-	case operationStarting:
-		label = "启动中"
-	case operationStopping:
-		label = "停止中"
-	default:
-		return "启动代理"
-	}
-	return "启动代理 (" + label + strings.Repeat(".", dotPhase) + ")"
 }
 
 // Run blocks and shows the tray (no console UI).
@@ -81,15 +55,10 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 	}
 	startDone := make(chan opResult, 1)
 	stopDone := make(chan opResult, 1)
-	tick := time.NewTicker(400 * time.Millisecond)
 	busy := false
-	operation := operationIdle
-	dotPhase := 0
 
 	setRunningUI := func(running bool) {
 		busy = false
-		operation = operationIdle
-		mStart.SetTitle("启动代理")
 		mStart.Enable()
 		if running {
 			mStart.Check()
@@ -111,48 +80,34 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 	if rememberErr == nil && remembered && !c.IsRunning() {
 		logger.Printf("remembered proxy state is enabled; starting automatically")
 		mStart.Check()
-		mStart.SetTitle(operationTitle(operationStarting, 1))
 		mStart.Disable()
 		busy = true
-		operation = operationStarting
-		dotPhase = 1
 		go func() { startDone <- opResult{err: c.Start()} }()
 	}
 
 	go func() {
 		for {
 			select {
-			case <-tick.C:
-				if operation != operationIdle {
-					dotPhase = (dotPhase % 3) + 1
-					mStart.SetTitle(operationTitle(operation, dotPhase))
-				}
-
 			case <-mStart.ClickedCh:
 				if busy {
 					continue
 				}
 				if c.IsRunning() {
-					mStart.SetTitle(operationTitle(operationStopping, 1))
+					mStart.Disable()
 					busy = true
-					operation = operationStopping
-					dotPhase = 1
 					go func() { stopDone <- opResult{err: c.Stop(), remember: true} }()
 				} else {
-					mStart.Check() // immediate checkmark
-					mStart.SetTitle(operationTitle(operationStarting, 1))
+					mStart.Check()
+					mStart.Disable()
 					busy = true
-					operation = operationStarting
-					dotPhase = 1
 					go func() { startDone <- opResult{err: c.Start(), remember: true} }()
 				}
 
 			case r := <-startDone:
-				operation = operationIdle
 				if r.err != nil {
 					logger.Printf("start: %v", r.err)
 					mStart.Uncheck()
-					mStart.SetTitle("启动代理")
+					mStart.Enable()
 					busy = false
 					mMon.Disable()
 					systray.SetTooltip("hellogrok 启动失败")
@@ -168,7 +123,6 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 				}
 
 			case r := <-stopDone:
-				operation = operationIdle
 				if r.err != nil {
 					logger.Printf("stop: %v", r.err)
 					dialog.Info("hellogrok 停止失败", "为避免留下失效代理配置，hellogrok 仍保持运行:\n"+r.err.Error())
@@ -207,7 +161,6 @@ func onReady(c Controller, icon []byte, logger *log.Logger) {
 					setRunningUI(c.IsRunning())
 					continue
 				}
-				tick.Stop()
 				systray.Quit()
 				return
 			}

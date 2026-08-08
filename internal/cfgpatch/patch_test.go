@@ -1,6 +1,7 @@
 package cfgpatch
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,103 @@ func TestChannelProxyURLRoundTrip(t *testing.T) {
 		if !IsProxyURL(raw) {
 			t.Fatalf("loopback facade URL %q was not classified as proxy", raw)
 		}
+	}
+}
+
+func TestApplyTargetsQuotesLegacyDottedModelHeaderAndRestoresExactly(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := strings.Join([]string{
+		`[model.legacy.with-dot] # preserve header comment`,
+		`name = "Legacy.v1-beta"`,
+		`model = "wire.model-v1"`,
+		`base_url = "https://legacy.example/v1"`,
+		`api_key = "legacy-key"`,
+		``,
+		`[model."quoted.with-dot"]`,
+		`name = "Quoted.v2-beta"`,
+		`base_url = "https://quoted.example/v1"`,
+		`api_key = "quoted-key"`,
+		``,
+		`[model.with-dash]`,
+		`name = "Dash.v3-beta"`,
+		`base_url = "https://dash.example/v1"`,
+		`api_key = "dash-key"`,
+		``,
+	}, "\r\n")
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := ApplyTargets(configPath, statePath, []Target{
+		{ID: "legacy.with-dot"},
+		{ID: "quoted.with-dot"},
+		{ID: "with-dash"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ModelSections != 1 || result.ValidatedTargets != 3 {
+		t.Fatalf("rewrite result = %+v", result)
+	}
+	if len(result.LegacyModelAliases) != 1 || result.LegacyModelAliases["legacy"] != "legacy.with-dot" {
+		t.Fatalf("legacy model aliases = %#v", result.LegacyModelAliases)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(patched)
+	for _, want := range []string{
+		`[model."legacy.with-dot"] # preserve header comment`,
+		`[model."quoted.with-dot"]`,
+		`[model.with-dash]`,
+		`name = "Legacy.v1-beta"`,
+		`base_url = "http://127.0.0.1:18787/c/legacy.with-dot"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("patched config missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, `[model.legacy.with-dot]`) {
+		t.Fatalf("legacy dotted header was not normalized:\n%s", text)
+	}
+
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("restore was not byte-exact\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestApplyTargetsDoesNotGuessAmbiguousLegacyDottedModelAlias(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.provider.one]\nbase_url = \"https://one.example/v1\"\n\n" +
+		"[model.provider.two]\nbase_url = \"https://two.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ApplyTargets(configPath, statePath, []Target{{ID: "provider.one"}, {ID: "provider.two"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ModelSections != 2 || len(result.LegacyModelAliases) != 0 {
+		t.Fatalf("ambiguous rewrite result = %+v", result)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := os.ReadFile(configPath)
+	if string(restored) != original {
+		t.Fatalf("ambiguous config was not restored exactly: %q", restored)
 	}
 }
 
@@ -984,6 +1082,37 @@ func TestRestoreRejectsAllOlderRewriteStateVersions(t *testing.T) {
 				t.Fatalf("legacy state should remain for manual recovery: %v", err)
 			}
 		})
+	}
+}
+
+func TestRestoreAcceptsVersionFiveRewriteState(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	statePath := filepath.Join(dir, "state.json")
+	original := "[model.one]\nbase_url = \"https://one.example/v1\"\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyTargets(configPath, statePath, []Target{{ID: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded = bytes.Replace(encoded, []byte(`"version": 6`), []byte(`"version": 5`), 1)
+	if err := os.WriteFile(statePath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(configPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("version 5 state did not restore exactly: %q", restored)
 	}
 }
 

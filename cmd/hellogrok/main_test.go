@@ -6,14 +6,18 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hellowind777/hellogrok/internal/appinfo"
 	"github.com/hellowind777/hellogrok/internal/cfgpatch"
 	"github.com/hellowind777/hellogrok/internal/config"
+	"github.com/hellowind777/hellogrok/internal/groksync"
 	"github.com/hellowind777/hellogrok/internal/proxy"
 )
 
@@ -80,6 +84,8 @@ func TestSecondInstanceDoesNotRestoreActiveInstanceConfig(t *testing.T) {
 	app := &App{logger: logger, dataDir: dataDir, server: server}
 	if err := app.Start(); err == nil {
 		t.Fatal("second instance unexpectedly started on an occupied address")
+	} else if !strings.Contains(err.Error(), "已被占用") {
+		t.Fatalf("occupied address error = %v", err)
 	}
 	if err := app.Stop(); err != nil {
 		t.Fatalf("stopping non-owning second instance: %v", err)
@@ -113,6 +119,131 @@ func TestAppRemembersProxyEnabledStateAcrossInstances(t *testing.T) {
 	}
 	if enabled, err := first.ProxyEnabledOnLaunch(); err != nil || !enabled {
 		t.Fatalf("remembered enabled=%v err=%v", enabled, err)
+	}
+}
+
+func TestStatusDetailPutsEachSectionFirstItemOnHeadingLine(t *testing.T) {
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = "127.0.0.1:18787"
+	app := &App{
+		running:        true,
+		server:         server,
+		patchedIDs:     []string{"model-b", "model-a"},
+		grokSyncStatus: "已刷新 1/1 个空闲自定义模型会话",
+	}
+	detail := app.StatusDetail()
+	for _, want := range []string{
+		"【代理】 本地入口：http://127.0.0.1:18787/c/<渠道>/responses",
+		"【配置恢复】 临时改写：2 个渠道，停止代理：恢复原值",
+		"【渠道】 配置校验：已通过；数量：2 个\n列表：model-a, model-b",
+		"【Grok 会话】 热切换：已刷新 1/1 个空闲自定义模型会话",
+		"【协议与搜索】 Grok 入口：Responses\n上游协议：按渠道使用 Responses、Messages 或 Chat Completions\n搜索分流：按渠道有效配置",
+	} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("status detail is missing %q:\n%s", want, detail)
+		}
+	}
+	for _, category := range []string{"【代理】", "【渠道】", "【Grok 会话】", "【协议与搜索】", "【配置恢复】"} {
+		if strings.Contains(detail, category+"\n") {
+			t.Fatalf("category %s is separated from its first item:\n%s", category, detail)
+		}
+	}
+}
+
+func TestStoppedStatusDetailPutsFirstItemOnHeadingLine(t *testing.T) {
+	app := &App{lastError: "test warning"}
+	detail := app.StatusDetail()
+	want := "【代理】 状态：已停止\n配置：未改写\n本地端口：未监听\n\n【上次错误】 test warning"
+	if detail != want {
+		t.Fatalf("stopped status detail = %q, want %q", detail, want)
+	}
+}
+
+func TestAppHotRefreshesDottedCustomModelOnEnableAndDisable(t *testing.T) {
+	dir := t.TempDir()
+	grokHome := filepath.Join(dir, "grok")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(grokHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", grokHome)
+	configPath := filepath.Join(grokHome, "config.toml")
+	original := "[model.provider.v1-beta]\n" +
+		"name = \"Provider.v1-beta\"\n" +
+		"base_url = \"https://provider.example/v1\"\n" +
+		"api_key = \"test-key\"\n" +
+		"supports_backend_search = false\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var refreshTargets []map[string]string
+	refresh := func(_ context.Context, selections map[string]string) (groksync.Result, error) {
+		captured := make(map[string]string, len(selections))
+		for currentID, desiredID := range selections {
+			captured[currentID] = desiredID
+		}
+		refreshTargets = append(refreshTargets, captured)
+		return groksync.Result{
+			GrokFound:         true,
+			ReachableLeaders:  1,
+			TargetSessions:    1,
+			RefreshedSessions: 1,
+		}, nil
+	}
+	logger := log.New(io.Discard, "", 0)
+	server := proxy.New(logger)
+	server.PathAddr = "127.0.0.1:0"
+	app := &App{
+		logger:              logger,
+		dataDir:             dataDir,
+		server:              server,
+		refreshGrokSessions: refresh,
+	}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	patched, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patched), `[model."provider.v1-beta"]`) {
+		t.Fatalf("dotted model header was not normalized:\n%s", patched)
+	}
+	if detail := app.StatusDetail(); !strings.Contains(detail, "已刷新 1/1 个空闲自定义模型会话") {
+		t.Fatalf("hot-reload status missing:\n%s", detail)
+	}
+	if err := app.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if len(refreshTargets) != 2 {
+		t.Fatalf("refresh calls = %d, want enable and disable", len(refreshTargets))
+	}
+	if got := refreshTargets[0]; got["provider.v1-beta"] != "provider.v1-beta" || got["provider"] != "provider.v1-beta" {
+		t.Fatalf("enable refresh targets = %v", got)
+	}
+	if got := refreshTargets[1]; len(got) != 2 || got["provider.v1-beta"] != "provider" || got["provider"] != "provider" {
+		t.Fatalf("disable refresh targets = %v", got)
+	}
+	restored, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("config was not restored exactly\nwant: %q\ngot:  %q", original, restored)
+	}
+}
+
+func TestGrokSessionSelectionsKeepModelsWithoutLegacyAliases(t *testing.T) {
+	targets := []string{"provider.v1-beta", "ordinary"}
+	aliases := map[string]string{"provider": "provider.v1-beta"}
+	enable := enableGrokSessionSelections(targets, aliases)
+	if enable["provider.v1-beta"] != "provider.v1-beta" || enable["provider"] != "provider.v1-beta" || enable["ordinary"] != "ordinary" {
+		t.Fatalf("enable selections = %v", enable)
+	}
+	disable := disableGrokSessionSelections(targets, aliases)
+	if disable["provider.v1-beta"] != "provider" || disable["provider"] != "provider" || disable["ordinary"] != "ordinary" {
+		t.Fatalf("disable selections = %v", disable)
 	}
 }
 
@@ -374,9 +505,19 @@ func TestAppStopRelinquishesCompleteExternalProviderReplacement(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	var refreshTargets []map[string]string
+	refresh := func(_ context.Context, selections map[string]string) (groksync.Result, error) {
+		refreshTargets = append(refreshTargets, cloneStringMap(selections))
+		return groksync.Result{GrokFound: true, ReachableLeaders: 1}, nil
+	}
 	server := proxy.New(log.New(io.Discard, "", 0))
 	server.PathAddr = "127.0.0.1:0"
-	app := &App{logger: log.New(io.Discard, "", 0), dataDir: dataDir, server: server}
+	app := &App{
+		logger:              log.New(io.Discard, "", 0),
+		dataDir:             dataDir,
+		server:              server,
+		refreshGrokSessions: refresh,
+	}
 	if err := app.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -396,6 +537,9 @@ func TestAppStopRelinquishesCompleteExternalProviderReplacement(t *testing.T) {
 	}
 	if _, err := os.Stat(cfgpatch.StatePath(dataDir)); !os.IsNotExist(err) {
 		t.Fatalf("obsolete recovery state remains: %v", err)
+	}
+	if len(refreshTargets) != 2 || len(refreshTargets[1]) != 0 {
+		t.Fatalf("external replacement selected obsolete models: %v", refreshTargets)
 	}
 }
 
@@ -455,117 +599,120 @@ func TestEnsureFacadeIdleRejectsOccupiedAddress(t *testing.T) {
 	}
 }
 
-func TestResolveSearchRoutesExplicitClientModelOverridesEveryConversationRoute(t *testing.T) {
-	var detected []config.Route
-	var probeX bool
+func TestAppStartReportsOccupiedFacadeAddress(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	server := proxy.New(log.New(io.Discard, "", 0))
+	server.PathAddr = listener.Addr().String()
 	app := &App{
 		logger:  log.New(io.Discard, "", 0),
 		dataDir: t.TempDir(),
-		detectSearchCapabilities: func(_ context.Context, routes []config.Route, _ string, includeX bool) map[string]proxy.SearchCapabilities {
-			detected = append([]config.Route(nil), routes...)
-			probeX = includeX
-			return map[string]proxy.SearchCapabilities{
-				"deepseek-v4-flash": {
-					WebSearch: proxy.SearchToolCapability{
-						State: proxy.CapabilitySupported, Source: "probe",
-						ChatDialect: config.ChatSearchDialectWebSearchOptions,
-					},
-				},
-			}
-		},
+		server:  server,
 	}
-	routes := []config.Route{
-		{ChannelID: "grok-custom", WireModel: "grok-4.5", APIBackend: "responses", SupportsBackendSearch: true, BackendSearchSet: true},
-		{ChannelID: "deepseek-v4-flash", WireModel: "deepseek-v4-flash", APIBackend: "chat_completions", SupportsBackendSearch: true, BackendSearchSet: true},
-		{ChannelID: "plain", WireModel: "plain", APIBackend: "chat_completions"},
+	err = app.Start()
+	if err == nil || !strings.Contains(err.Error(), "本地代理端口 "+server.PathAddr+" 已被占用") {
+		t.Fatalf("occupied facade error = %v", err)
 	}
-	effective := app.resolveSearchRoutes(context.Background(), routes, config.WebSearchSelection{
-		Model: "deepseek-v4-flash", Explicit: true, Source: "config",
-	})
-	for _, route := range effective {
-		if route.SupportsBackendSearch || !route.HostedSearchKnown || route.HostedWebSearch || route.HostedXSearch {
-			t.Fatalf("explicit client-search model did not force a client route: %+v", route)
-		}
-	}
-	if probeX || len(detected) != 1 || detected[0].ChannelID != "deepseek-v4-flash" {
-		t.Fatalf("validation routes=%+v probeX=%t", detected, probeX)
-	}
-	if effective[1].HostedChatSearchDialect != config.ChatSearchDialectWebSearchOptions {
-		t.Fatalf("client search model lost detected Chat dialect: %+v", effective[1])
+	if app.IsRunning() {
+		t.Fatal("app remained running after occupied facade address")
 	}
 }
 
-func TestResolveSearchRoutesAutoDetectsOnlyMissingGrokDeclarations(t *testing.T) {
-	var detected []config.Route
-	app := &App{
-		logger:  log.New(io.Discard, "", 0),
-		dataDir: t.TempDir(),
-		detectSearchCapabilities: func(_ context.Context, routes []config.Route, _ string, includeX bool) map[string]proxy.SearchCapabilities {
-			if !includeX {
-				t.Fatal("automatic Grok detection omitted x_search")
-			}
-			detected = append([]config.Route(nil), routes...)
-			return map[string]proxy.SearchCapabilities{
-				"grok-auto": {
-					WebSearch: proxy.SearchToolCapability{
-						State: proxy.CapabilitySupported, Source: "probe",
-						ChatDialect: config.ChatSearchDialectWebSearchOptions,
-					},
-					XSearch: proxy.SearchToolCapability{State: proxy.CapabilityUnsupported, Source: "probe"},
-				},
-			}
-		},
-	}
+func TestResolveSearchRoutesExplicitClientModelOverridesEveryConversationRoute(t *testing.T) {
+	app := &App{logger: log.New(io.Discard, "", 0)}
 	routes := []config.Route{
-		{ChannelID: "grok-auto", WireModel: "grok-4.5", APIBackend: "chat_completions"},
-		{ChannelID: "gpt-auto", WireModel: "gpt-5.6", APIBackend: "responses"},
-		{ChannelID: "grok-explicit-false", WireModel: "grok-4.5", APIBackend: "responses", BackendSearchSet: true},
-		{ChannelID: "grok-explicit-true", WireModel: "grok-4.5", APIBackend: "responses", BackendSearchSet: true, SupportsBackendSearch: true},
+		{ChannelID: "grok-custom", WireModel: "grok-4.5", APIBackend: "responses", SupportsBackendSearch: true},
+		{ChannelID: "deepseek-v4-flash", WireModel: "deepseek-v4-flash", APIBackend: "chat_completions", SupportsBackendSearch: true},
+		{ChannelID: "plain", WireModel: "plain", APIBackend: "chat_completions"},
 	}
-	effective := app.resolveSearchRoutes(context.Background(), routes, config.WebSearchSelection{})
-	if len(detected) != 1 || detected[0].ChannelID != "grok-auto" {
-		t.Fatalf("automatic candidates = %+v", detected)
+	effective := app.resolveSearchRoutes(routes, config.WebSearchSelection{
+		Model: "deepseek-v4-flash", Explicit: true, Source: "config",
+	})
+	for _, route := range effective {
+		if route.SupportsBackendSearch {
+			t.Fatalf("explicit client-search model did not force a client route: %+v", route)
+		}
 	}
+	if !routes[0].SupportsBackendSearch || !routes[1].SupportsBackendSearch {
+		t.Fatalf("search routing mutated its input: %+v", routes)
+	}
+}
+
+func TestResolveSearchRoutesTrustsOnlyConfiguredBackendSearch(t *testing.T) {
+	app := &App{logger: log.New(io.Discard, "", 0)}
+	routes := []config.Route{
+		{ChannelID: "grok-missing", WireModel: "grok-4.5", APIBackend: "responses"},
+		{ChannelID: "gpt-false", WireModel: "gpt-5.6", APIBackend: "responses"},
+		{ChannelID: "grok-true", WireModel: "grok-4.5", APIBackend: "responses", SupportsBackendSearch: true},
+	}
+	effective := app.resolveSearchRoutes(routes, config.WebSearchSelection{})
 	byID := map[string]config.Route{}
 	for _, route := range effective {
 		byID[route.ChannelID] = route
 	}
-	auto := byID["grok-auto"]
-	if !auto.SupportsBackendSearch || !auto.HostedSearchKnown || !auto.HostedWebSearch || auto.HostedXSearch ||
-		auto.HostedChatSearchDialect != config.ChatSearchDialectWebSearchOptions {
-		t.Fatalf("detected Grok route = %+v", auto)
-	}
-	gpt := byID["gpt-auto"]
-	if gpt.SupportsBackendSearch || !gpt.HostedSearchKnown {
-		t.Fatalf("missing non-Grok route changed incorrectly: %+v", gpt)
-	}
-	explicitFalse := byID["grok-explicit-false"]
-	if explicitFalse.SupportsBackendSearch || !explicitFalse.HostedSearchKnown {
-		t.Fatalf("explicit false route was not preserved: %+v", explicitFalse)
-	}
-	explicitTrue := byID["grok-explicit-true"]
-	if !explicitTrue.SupportsBackendSearch || explicitTrue.HostedSearchKnown {
-		t.Fatalf("explicit true route was not preserved: %+v", explicitTrue)
+	if byID["grok-missing"].SupportsBackendSearch || byID["gpt-false"].SupportsBackendSearch ||
+		!byID["grok-true"].SupportsBackendSearch {
+		t.Fatalf("backend-search configuration was not preserved: %+v", byID)
 	}
 }
 
-func TestResolveSearchRoutesUnknownDetectionKeepsOfficialClientFallback(t *testing.T) {
-	app := &App{
-		logger:  log.New(io.Discard, "", 0),
-		dataDir: t.TempDir(),
-		detectSearchCapabilities: func(_ context.Context, routes []config.Route, _ string, _ bool) map[string]proxy.SearchCapabilities {
-			return map[string]proxy.SearchCapabilities{
-				"grok-auto": {
-					WebSearch: proxy.SearchToolCapability{State: proxy.CapabilityUnknown, Source: "probe-http"},
-					XSearch:   proxy.SearchToolCapability{State: proxy.CapabilityUnknown, Source: "probe-http"},
-				},
-			}
+func TestAppStartDoesNotProbeUpstreamSearchCapability(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		modelID    string
+		modelsTOML string
+		capability string
+	}{
+		{name: "omitted backend search", modelID: "grok-missing-search-flag"},
+		{
+			name:       "explicit client search model",
+			modelID:    "grok-explicit-search-model",
+			modelsTOML: "[models]\nweb_search = \"grok-explicit-search-model\"\n\n",
+			capability: "supports_backend_search = true\n",
 		},
-	}
-	effective := app.resolveSearchRoutes(context.Background(), []config.Route{{
-		ChannelID: "grok-auto", WireModel: "grok-4.5", APIBackend: "responses",
-	}}, config.WebSearchSelection{})
-	if len(effective) != 1 || effective[0].SupportsBackendSearch || !effective[0].HostedSearchKnown {
-		t.Fatalf("unknown capability must materialize false for Build's client fallback: %+v", effective)
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var upstreamRequests atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				upstreamRequests.Add(1)
+			}))
+			defer upstream.Close()
+
+			dir := t.TempDir()
+			grokHome := filepath.Join(dir, "grok")
+			if err := os.MkdirAll(grokHome, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GROK_HOME", grokHome)
+			original := test.modelsTOML + "[model." + test.modelID + "]\n" +
+				"model = \"grok-4.5\"\n" +
+				"base_url = \"" + upstream.URL + "/v1\"\n" +
+				"api_key = \"test-key\"\n" + test.capability
+			if err := os.WriteFile(filepath.Join(grokHome, "config.toml"), []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			server := proxy.New(log.New(io.Discard, "", 0))
+			server.PathAddr = "127.0.0.1:0"
+			app := &App{logger: log.New(io.Discard, "", 0), dataDir: filepath.Join(dir, "data"), server: server}
+			if err := app.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if app.IsRunning() {
+					_ = app.Stop()
+				}
+			})
+			if got := upstreamRequests.Load(); got != 0 {
+				t.Fatalf("startup contacted upstream %d time(s), want 0", got)
+			}
+			if err := app.Stop(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

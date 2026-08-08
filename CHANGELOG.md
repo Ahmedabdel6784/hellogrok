@@ -4,26 +4,59 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-08-08
+
+### Added
+
+- Shared-leader ACP hot reload after proxy enable and disable, including forward and reverse model-ID selection for idle custom-model sessions.
+- Safe migration from a uniquely truncated legacy dotted model ID to its normalized full ID.
+- Compatibility with both current `session/setModel` and legacy `session/set_model` ACP method names.
+- Windows status/log toolbar with usage-day retention choices and next-match log search.
+- Log retention by distinct days the application was actually used; the default keeps the latest 7 usage days.
+
+### Fixed
+
+- Unquoted dotted model tables are normalized while the proxy is active and restored byte-for-byte on stop.
+- Channel IDs, display names, and upstream model names containing dots or dashes retain channel authentication and routing.
+- Version 5 rewrite transactions remain recoverable after the state schema upgrade.
+- Live Windows named-pipe leaders misreported as stale by Grok Build 1.0.0 are recovered only when their lock is actively held; leftover lock files remain ignored.
+- Windows port conflicts now recognize WinSock error 10048 and show a direct `127.0.0.1:18787`-occupied error without touching Grok configuration.
+- The legacy singular `api_backend = "message"` spelling is accepted as a compatibility alias for Grok Build's official `messages` backend.
+- Disabling the proxy switches normalized dotted-model sessions back to the restored legacy ID; external provider replacement reloads the catalog without selecting obsolete models.
+- Client search no longer infers mandatory tool use from prompt keywords, and wire aliases are restored only in structured tool-name fields.
+- Provider-only search replay state is isolated by channel, preceding conversation, and stable search identity; ambiguous matches are rejected and Messages search blocks are stored atomically.
+- Malformed 2xx Responses, Messages, and Chat Completions envelopes are rejected with 502 instead of being forwarded as successful responses.
+- Responses validation now accepts Grok Build's official reasoning items when their optional `content` field is absent or null.
+- Deterministic local proxy failures now return `X-Should-Retry: false`, preventing Grok Build from retrying configuration and schema errors up to its full retry budget; upstream transport failures remain retryable.
+- Successful HTML pages from a misconfigured upstream URL are rejected with a direct `base_url`/`api_backend` diagnostic instead of a raw JSON parse error.
+- Anthropic Messages and Chat Completions requests now preserve `stream=true`; their upstream SSE is translated incrementally into Responses events for reasoning, text, function arguments, hosted search, and terminal errors instead of being buffered and replayed as fake streaming.
+- Search URLs from Responses output, Messages results, and Chat citations are emitted in both `web_search_call.action.sources` and `output_text.annotations`. Any of the three protocols can therefore serve as Grok Build's selected client-search model independently of `supports_backend_search`, while hosted search uses the same normalized output. Both render paths can show the native deduplicated site count. When search execution is independently confirmed but structured citations are missing, valid HTTP(S) links in the final answer are used as source evidence; ordinary answer links never create a search call, and no count is invented without a real URL.
+- An upstream that ignores `stream=true` and returns JSON remains usable through a buffered SSE fallback, and that downgrade is stated explicitly in the proxy log.
+
+### Changed
+
+- Active or input-blocked sessions are skipped during hot reload; `--no-leader` sessions report the manual `/model` fallback instead of being treated as refreshed.
+- Proxy startup and shutdown keep a static tray label; the item is temporarily disabled and failures are shown in a dialog.
+- Logs append across proxy sessions instead of being truncated, and the status panel is grouped into scan-friendly sections.
+- Proxy startup no longer probes upstream search capabilities. Omitted and false `supports_backend_search` values use client search, explicit true values are trusted, and an explicitly selected search model is routed without startup validation.
+- Upstream authentication now defaults to Bearer for every backend, matching Grok Build; Messages providers that require `X-Api-Key` must opt in with `auth_scheme = "x_api_key"`.
+
 ## [0.1.1] — 2026-08-07
 
 ### Added
 
 - Explicit search model selection via `[models].web_search` config key and `GROK_WEB_SEARCH_MODEL` environment variable, with env taking precedence over config.
-- Hosted search capability auto-detection for Grok relay channels at startup (`web_search` + `x_search` probing).
-- Chat Completions search dialect auto-detection (`search_parameters` vs `web_search_options`).
 - CC Switch takeover detection before config rewrite — start is refused when CC Switch already owns Grok Build.
 - Single-instance enforcement for both tray and foreground modes via OS-level lock.
 - Windows log window application icon display in title bar and taskbar.
-- Search route resolution logging at startup, visible in `hellogrok routes` and the log window.
+- Configured search route resolution logging at startup, visible in `hellogrok routes` and the log window.
 
 ### Changed
 
 - Tray now defaults to proxy-enabled on first launch.
 - Tray quit defers exit when a config-ownership conflict exists, preventing orphaned proxy URLs.
 - SIGINT/SIGTERM handlers retry stop on deferred errors instead of leaving the process inconsistent.
-- `BackendSearchSet` field distinguishes explicit `supports_backend_search` declarations from Build's false default, enabling runtime probing for unset values.
-- `Route` now carries `HostedSearchKnown`, `HostedWebSearch`, `HostedXSearch`, and `HostedChatSearchDialect` for capability-aware request normalization.
-- Tool choice normalization is now capability-aware — only confirmed hosted search declarations are injected.
+- Tool choice normalization respects the configured `supports_backend_search` value.
 
 ### Fixed
 
@@ -45,5 +78,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
+[0.1.2]: https://github.com/hellowind777/hellogrok/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/hellowind777/hellogrok/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/hellowind777/hellogrok/releases/tag/v0.1.0

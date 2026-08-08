@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,8 @@ import (
 	"github.com/hellowind777/hellogrok/internal/config"
 	"github.com/hellowind777/hellogrok/internal/console"
 	"github.com/hellowind777/hellogrok/internal/dialog"
+	"github.com/hellowind777/hellogrok/internal/groksync"
+	"github.com/hellowind777/hellogrok/internal/logretention"
 	"github.com/hellowind777/hellogrok/internal/logui"
 	"github.com/hellowind777/hellogrok/internal/logview"
 	"github.com/hellowind777/hellogrok/internal/openpath"
@@ -72,6 +75,14 @@ func main() {
 
 	cli := len(os.Args) > 1
 	_ = os.MkdirAll(dataDir, 0o700)
+	retentionNotice := ""
+	if days, retentionErr := prefs.LogRetentionUsageDays(prefs.Path(dataDir)); retentionErr != nil {
+		retentionNotice = "load log retention: " + retentionErr.Error()
+	} else if removed, retentionErr := logretention.Prune(logPath, days, time.Now()); retentionErr != nil {
+		retentionNotice = "prune log history: " + retentionErr.Error()
+	} else if removed > 0 {
+		retentionNotice = fmt.Sprintf("log retention removed %d older usage day(s); keeping %d", removed, days)
+	}
 
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -102,16 +113,20 @@ func main() {
 
 	logger := log.New(logWriter, "", log.LstdFlags|log.Lmsgprefix)
 	logger.SetPrefix("[hellogrok] ")
-
-	app := &App{
-		logger:  logger,
-		logFile: lf,
-		dataDir: dataDir,
-		logPath: logPath,
-		server:  proxy.New(logger),
+	if retentionNotice != "" {
+		logger.Printf("%s", retentionNotice)
 	}
 
-	logger.Printf("application ready (log will reset when proxy starts)")
+	app := &App{
+		logger:              logger,
+		logFile:             lf,
+		dataDir:             dataDir,
+		logPath:             logPath,
+		server:              proxy.New(logger),
+		refreshGrokSessions: groksync.Refresh,
+	}
+
+	logger.Printf("application ready")
 
 	if cli {
 		if err := runForeground(app, logger); err != nil {
@@ -301,29 +316,25 @@ func printUsage(w io.Writer) {
 
 // App implements tray.Controller.
 type App struct {
-	logger                   *log.Logger
-	logFile                  *os.File
-	dataDir                  string
-	logPath                  string
-	server                   *proxy.Server
-	detectSearchCapabilities func(context.Context, []config.Route, string, bool) map[string]proxy.SearchCapabilities
+	logger              *log.Logger
+	logFile             *os.File
+	dataDir             string
+	logPath             string
+	server              *proxy.Server
+	refreshGrokSessions func(context.Context, map[string]string) (groksync.Result, error)
 
-	mu         sync.Mutex
-	running    bool
-	lastError  string
-	patchedIDs []string
+	mu             sync.Mutex
+	running        bool
+	lastError      string
+	patchedIDs     []string
+	modelAliases   map[string]string
+	grokSyncStatus string
 
 	cfgMu  sync.Mutex
 	prefMu sync.Mutex
 }
 
-func (a *App) resetSessionLog() {
-	if a.logFile != nil {
-		_ = a.logFile.Truncate(0)
-		_, _ = a.logFile.Seek(0, 0)
-	} else if a.logPath != "" {
-		_ = os.WriteFile(a.logPath, nil, 0o600)
-	}
+func (a *App) beginSessionLog() {
 	if a.logger != nil {
 		a.logger.Printf("======== session start %s ========", time.Now().Format("2006-01-02 15:04:05"))
 	}
@@ -349,19 +360,9 @@ func (a *App) StatusDetail() string {
 	defer a.mu.Unlock()
 	if !a.running {
 		if a.lastError != "" {
-			return "已停止。上次错误: " + a.lastError
+			return "【代理】 状态：已停止\n配置：未改写\n本地端口：未监听\n\n【上次错误】 " + a.lastError
 		}
-		return "代理未运行。勾选「启动代理」后：\n" +
-			"· 记忆代理启用状态；下次打开托盘时自动恢复\n" +
-			"· 校验并临时补全全部显式自定义模型的代理必需字段\n" +
-			"· 管理 base_url/api_base_url、api_backend 和有效 supports_backend_search\n" +
-			"· 显式搜索模型优先；否则 true 使用 hosted、false 使用客户端搜索、缺省 Grok 中转自动检测\n" +
-			"· 管理 [features].backend_tools 和 web_fetch 开关\n" +
-			"· 已配置子代理但缺省 enabled 时临时启用；显式 false 保持不变\n" +
-			"· 自动适配 Responses、Anthropic Messages 和 Chat Completions 搜索字段\n" +
-			"· 不创建、不选择、不修改任何 [models].web_search 搜索模型\n" +
-			"· 透传请求 + 响应补字段；渠道 api_key 防 OAuth 抢鉴权\n" +
-			"· 写入后回读验证；启动失败或停止时精确恢复全部原值"
+		return "【代理】 状态：已停止\n配置：未改写\n本地端口：未监听"
 	}
 	patched := append([]string(nil), a.patchedIDs...)
 	sort.Strings(patched)
@@ -369,24 +370,22 @@ func (a *App) StatusDetail() string {
 	if len(patched) > 0 {
 		list = strings.Join(patched, ", ")
 	}
-	warning := ""
-	if a.lastError != "" {
-		warning = "· 当前警告: " + a.lastError + "\n"
+	hotSwitch := "未报告"
+	if a.grokSyncStatus != "" {
+		hotSwitch = a.grokSyncStatus
 	}
-	return "运行中（逐渠道 Responses 外观层 + 搜索能力分流 + 响应补字段）。\n" +
-		warning +
-		"· 本地: http://" + a.server.PathAddr + "/c/<渠道>/responses\n" +
-		"· 上游保留原 base_url/api_base_url 路径前缀\n" +
-		"· 搜索分流: 显式 [models].web_search 优先；否则 true 使用 hosted、false 使用客户端搜索\n" +
-		"· 缺省 Grok 中转: 自动检测 hosted 能力；未确认时保留有效 xAI 凭据的官方搜索回退\n" +
-		"· 抓取模式: Build 本地 web_fetch（不依赖独立搜索模型）\n" +
-		"· 子代理: 缺省 enabled 已按 Build 预期临时修复，停止时精确恢复\n" +
-		"· 协议: Responses web_search / Messages server tool / Chat 按模型适配搜索字段\n" +
-		"· hellogrok 不创建、不选择、不修改搜索模型\n" +
-		"· 全部自定义渠道预先进入代理，无首次切换竞态\n" +
-		"· 必需配置已通过 TOML 回读校验\n" +
-		"· 当前已改写: " + list + "\n" +
-		"· 停止时恢复所有代理管理字段"
+	detail := "【代理】 本地入口：http://" + a.server.PathAddr + "/c/<渠道>/responses\n\n" +
+		fmt.Sprintf("【渠道】 配置校验：已通过；数量：%d 个\n", len(patched)) +
+		"列表：" + list + "\n\n" +
+		"【Grok 会话】 热切换：" + hotSwitch + "\n\n" +
+		"【协议与搜索】 Grok 入口：Responses\n" +
+		"上游协议：按渠道使用 Responses、Messages 或 Chat Completions\n" +
+		"搜索分流：按渠道有效配置\n\n" +
+		fmt.Sprintf("【配置恢复】 临时改写：%d 个渠道，停止代理：恢复原值", len(patched))
+	if a.lastError != "" {
+		detail += "\n\n【当前警告】 " + a.lastError
+	}
+	return detail
 }
 
 func (a *App) OpenMonitor() error {
@@ -398,7 +397,7 @@ func (a *App) OpenMonitor() error {
 	}
 	return logui.Open(a.logPath, func() (string, string) {
 		return a.StatusText(), a.StatusDetail()
-	})
+	}, a.LogRetentionUsageDays, a.SetLogRetentionUsageDays)
 }
 
 func (a *App) Start() error {
@@ -415,9 +414,12 @@ func (a *App) Start() error {
 	// Own the facade address before touching config. A second instance must not
 	// mistake the active instance's rewrite state for an orphan and restore it.
 	if err := a.server.ReservePath(); err != nil {
+		if addressInUse(err) {
+			return a.abortStart(fmt.Errorf("本地代理端口 %s 已被占用，请关闭占用该端口的程序后重试", a.server.PathAddr))
+		}
 		return a.abortStart(fmt.Errorf("reserve local facade: %w", err))
 	}
-	a.resetSessionLog()
+	a.beginSessionLog()
 
 	if takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath); err != nil {
 		return a.abortStart(fmt.Errorf("inspect config ownership before start: %w", err))
@@ -458,7 +460,7 @@ func (a *App) Start() error {
 	if err != nil {
 		return a.abortStart(fmt.Errorf("load web search model: %w", err))
 	}
-	routes = a.resolveSearchRoutes(context.Background(), routes, searchSelection)
+	routes = a.resolveSearchRoutes(routes, searchSelection)
 	if takeover, err := cfgpatch.DetectCCSwitchTakeover(cfgPath); err != nil {
 		return a.abortStart(fmt.Errorf("recheck config ownership before rewrite: %w", err))
 	} else if takeover.Active() {
@@ -507,9 +509,11 @@ func (a *App) Start() error {
 	}
 	a.patchedIDs = append([]string(nil), res.Targets...)
 	sort.Strings(a.patchedIDs)
-	a.logger.Printf("config rewrite all: base=%d api_base=%d api_backend=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
-		res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
+	a.modelAliases = cloneStringMap(res.LegacyModelAliases)
+	a.logger.Printf("config rewrite all: model_sections=%d base=%d api_base=%d api_backend=%d backend_search=%d backend_tools=%d web_fetch=%d subagents_enabled=%d targets=%v",
+		res.ModelSections, res.BaseURLs, res.APIBaseURLs, res.APIBackends, res.BackendSearch, res.BackendTools, res.WebFetch, res.SubagentsEnabled, res.Targets)
 	a.logger.Printf("config validation passed: backend_tools=true web_fetch=true backend_search=materialized subagent_defaults=repaired-if-needed responses_targets=%d", res.ValidatedTargets)
+	a.refreshOpenGrokSessions("enable", enableGrokSessionSelections(a.patchedIDs, a.modelAliases))
 	for _, route := range routes {
 		backend := strings.TrimSpace(route.APIBackend)
 		switch backend {
@@ -523,11 +527,7 @@ func (a *App) Start() error {
 			a.logger.Printf("search adapter unavailable: model=%s api_backend=%s", route.ChannelID, backend)
 		}
 		if route.SupportsBackendSearch {
-			if route.HostedSearchKnown {
-				a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel web_search=%t x_search=%t chat_dialect=%s", route.ChannelID, route.HostedWebSearch, route.HostedXSearch, route.HostedChatSearchDialect)
-			} else {
-				a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel capability=explicit", route.ChannelID)
-			}
+			a.logger.Printf("channel search: model=%s supports_backend_search=true mode=hosted-current-channel source=config", route.ChannelID)
 		} else {
 			a.logger.Printf("channel search: model=%s supports_backend_search=false mode=client-web_search configured-model-or-authenticated-official-default", route.ChannelID)
 		}
@@ -538,87 +538,36 @@ func (a *App) Start() error {
 	return nil
 }
 
+func addressInUse(err error) bool {
+	// Windows reports WSAEADDRINUSE (10048), which is not represented by
+	// syscall.EADDRINUSE in every Go Windows toolchain.
+	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, syscall.Errno(10048))
+}
+
 func (a *App) resolveSearchRoutes(
-	ctx context.Context,
 	routes []config.Route,
 	selection config.WebSearchSelection,
 ) []config.Route {
 	effective := append([]config.Route(nil), routes...)
-	detect := a.detectSearchCapabilities
-	if detect == nil {
-		detect = a.server.DetectSearchCapabilities
-	}
-
-	if selection.Explicit {
-		var searchRoutes []config.Route
-		for index := range effective {
-			effective[index].SupportsBackendSearch = false
-			effective[index].HostedSearchKnown = true
-			effective[index].HostedWebSearch = false
-			effective[index].HostedXSearch = false
-			if effective[index].ChannelID == selection.Model {
-				searchRoutes = append(searchRoutes, routes[index])
-			}
-		}
-		a.logger.Printf("search routing: explicit client model=%q source=%s; conversation channels forced supports_backend_search=false", selection.Model, selection.Source)
-		if len(searchRoutes) > 0 {
-			reports := detect(ctx, searchRoutes, proxy.SearchCapabilityCachePath(a.dataDir), false)
-			for index := range effective {
-				route := &effective[index]
-				if route.ChannelID != selection.Model {
-					continue
-				}
-				capability := reports[route.ChannelID].WebSearch
-				route.HostedChatSearchDialect = capability.ChatDialect
-				a.logger.Printf("search model validation: model=%s web_search=%s source=%s chat_dialect=%s", route.ChannelID, capability.State, capability.Source, capability.ChatDialect)
-			}
-		} else if selection.Model != "" {
-			a.logger.Printf("search model validation: model=%s is not a proxied custom route; Build will resolve it directly", selection.Model)
-		} else {
-			a.logger.Printf("search model validation: explicit empty model disables a usable custom client-search route")
-		}
+	if !selection.Explicit {
 		return effective
 	}
 
-	var candidates []config.Route
+	proxiedSearchModel := false
 	for index := range effective {
-		route := &effective[index]
-		if route.BackendSearchSet {
-			if !route.SupportsBackendSearch {
-				route.HostedSearchKnown = true
-				route.HostedWebSearch = false
-				route.HostedXSearch = false
-			}
-			continue
-		}
-		route.SupportsBackendSearch = false
-		route.HostedSearchKnown = true
-		route.HostedWebSearch = false
-		route.HostedXSearch = false
-		if proxy.RouteLooksLikeGrok(*route) {
-			candidates = append(candidates, routes[index])
+		effective[index].SupportsBackendSearch = false
+		if effective[index].ChannelID == selection.Model {
+			proxiedSearchModel = true
 		}
 	}
-	if len(candidates) == 0 {
-		return effective
-	}
-
-	reports := detect(ctx, candidates, proxy.SearchCapabilityCachePath(a.dataDir), true)
-	for index := range effective {
-		route := &effective[index]
-		if route.BackendSearchSet || !proxy.RouteLooksLikeGrok(*route) {
-			continue
-		}
-		report := reports[route.ChannelID]
-		route.HostedWebSearch = report.WebSearch.State == proxy.CapabilitySupported
-		route.HostedXSearch = report.XSearch.State == proxy.CapabilitySupported
-		route.HostedChatSearchDialect = report.WebSearch.ChatDialect
-		route.SupportsBackendSearch = route.HostedWebSearch || route.HostedXSearch
-		a.logger.Printf("search capability: model=%s effective_backend_search=%t web_search=%s(%s) x_search=%s(%s) chat_dialect=%s",
-			route.ChannelID, route.SupportsBackendSearch,
-			report.WebSearch.State, report.WebSearch.Source,
-			report.XSearch.State, report.XSearch.Source,
-			report.WebSearch.ChatDialect)
+	a.logger.Printf("search routing: explicit client model=%q source=%s; conversation channels forced supports_backend_search=false; startup_probe=disabled", selection.Model, selection.Source)
+	switch {
+	case selection.Model == "":
+		a.logger.Printf("search model routing: explicit empty model disables a usable custom client-search route")
+	case proxiedSearchModel:
+		a.logger.Printf("search model routing: model=%s uses the local facade without startup validation", selection.Model)
+	default:
+		a.logger.Printf("search model routing: model=%s is not a proxied custom route; Build will resolve it directly", selection.Model)
 	}
 	return effective
 }
@@ -628,6 +577,85 @@ func (a *App) abortStart(err error) error {
 	a.server = proxy.New(a.logger)
 	a.lastError = err.Error()
 	return err
+}
+
+func (a *App) refreshOpenGrokSessions(phase string, selections map[string]string) {
+	if a.refreshGrokSessions == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	result, err := a.refreshGrokSessions(ctx, selections)
+
+	switch {
+	case !result.GrokFound:
+		a.grokSyncStatus = "未找到 grok 可执行文件；新窗口仍会读取配置，已打开窗口需在 /model 中重选当前模型"
+	case result.ReachableLeaders == 0:
+		a.grokSyncStatus = "未发现可连接的共享 leader；新窗口自动生效，--no-leader 窗口需在 /model 中重选当前模型"
+	default:
+		a.grokSyncStatus = fmt.Sprintf("已刷新 %d/%d 个空闲自定义模型会话", result.RefreshedSessions, result.TargetSessions)
+		if result.SkippedActiveSessions > 0 {
+			a.grokSyncStatus += fmt.Sprintf("，跳过 %d 个活动会话", result.SkippedActiveSessions)
+		}
+		if result.FailedSessions > 0 {
+			a.grokSyncStatus += fmt.Sprintf("，%d 个会话刷新失败", result.FailedSessions)
+		}
+	}
+	if err != nil {
+		a.grokSyncStatus += "；刷新不完整: " + err.Error()
+		a.logger.Printf("grok session hot reload phase=%s leaders=%d targets=%d refreshed=%d active_skipped=%d failed=%d error=%v",
+			phase, result.ReachableLeaders, result.TargetSessions, result.RefreshedSessions, result.SkippedActiveSessions, result.FailedSessions, err)
+		return
+	}
+	a.logger.Printf("grok session hot reload phase=%s leaders=%d targets=%d refreshed=%d active_skipped=%d failed=%d",
+		phase, result.ReachableLeaders, result.TargetSessions, result.RefreshedSessions, result.SkippedActiveSessions, result.FailedSessions)
+}
+
+func enableGrokSessionSelections(targetIDs []string, legacyAliases map[string]string) map[string]string {
+	selections := make(map[string]string, len(targetIDs)+len(legacyAliases))
+	for _, id := range targetIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			selections[id] = id
+		}
+	}
+	for legacyID, targetID := range legacyAliases {
+		legacyID = strings.TrimSpace(legacyID)
+		targetID = strings.TrimSpace(targetID)
+		if legacyID != "" && targetID != "" {
+			selections[legacyID] = targetID
+		}
+	}
+	return selections
+}
+
+func disableGrokSessionSelections(targetIDs []string, legacyAliases map[string]string) map[string]string {
+	selections := make(map[string]string, len(targetIDs)+len(legacyAliases))
+	for _, id := range targetIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			selections[id] = id
+		}
+	}
+	for legacyID, targetID := range legacyAliases {
+		legacyID = strings.TrimSpace(legacyID)
+		targetID = strings.TrimSpace(targetID)
+		if legacyID == "" || targetID == "" {
+			continue
+		}
+		selections[targetID] = legacyID
+		selections[legacyID] = legacyID
+	}
+	return selections
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }
 
 func (a *App) Stop() error {
@@ -677,14 +705,18 @@ func (a *App) Stop() error {
 	}
 	if relinquished {
 		a.logger.Printf("config ownership changed externally; no hellogrok routes remain, recovery state relinquished")
+		a.refreshOpenGrokSessions("disable", map[string]string{})
 	} else {
 		a.logger.Printf("config restore: %d proxy-managed setting(s) restored", n)
+		a.refreshOpenGrokSessions("disable", disableGrokSessionSelections(a.patchedIDs, a.modelAliases))
 	}
 
 	a.server.Stop()
 	a.server = proxy.New(a.logger)
 	a.running = false
 	a.patchedIDs = nil
+	a.modelAliases = nil
+	a.grokSyncStatus = ""
 	a.lastError = ""
 	a.logger.Printf("stopped")
 	return nil
@@ -712,4 +744,16 @@ func (a *App) SetProxyEnabledOnLaunch(enabled bool) error {
 	a.prefMu.Lock()
 	defer a.prefMu.Unlock()
 	return prefs.SetProxyEnabled(prefs.Path(a.dataDir), enabled)
+}
+
+func (a *App) LogRetentionUsageDays() (int, error) {
+	a.prefMu.Lock()
+	defer a.prefMu.Unlock()
+	return prefs.LogRetentionUsageDays(prefs.Path(a.dataDir))
+}
+
+func (a *App) SetLogRetentionUsageDays(days int) error {
+	a.prefMu.Lock()
+	defer a.prefMu.Unlock()
+	return prefs.SetLogRetentionUsageDays(prefs.Path(a.dataDir), days)
 }

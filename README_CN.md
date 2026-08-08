@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.1-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.2-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -47,13 +47,15 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 ### 渠道兼容
 
 - 支持上游 `responses`、`chat_completions` 和 Anthropic 兼容 `messages` API。
-- 将受支持的上游响应和流规范化为 Grok Build 可用格式。
+- 兼容历史单数写法 `message`；Grok Build 配置仍应优先使用官方复数写法 `messages`。
+- 逐帧透传 Responses SSE，并逐帧转换 Messages 与 Chat Completions SSE，包括推理、正文、函数参数、hosted 搜索活动和终止错误。
 - 保留每个渠道配置的上游 URL 路径和模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 
 ### 原生 Web 工具
 
 - 支持 hosted 和客户端搜索两种 Grok Build 原生 `web_search` 工作流。
+- 将三种受支持上游协议中的真实搜索 URL 同时保留到 `web_search_call.action.sources` 和 `output_text.annotations`；响应已独立证明确实执行搜索但缺少结构化引用时，也会使用最终回答中的有效链接，让当前 Grok Build 的 hosted 与客户端搜索都能显示原生的去重站点数量。
 - 当前代理工具权限允许时，将 `web_fetch` 作为独立工具保留。
 - 让受支持的子代理使用相同的搜索行为。
 - Grok 官方模型继续使用 Grok Build 原生搜索和登录路径。
@@ -72,7 +74,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 记住用户选择的代理启用状态，并在下次打开托盘时恢复。
 - 首次启动默认启用代理，让新用户立即可用。
 - 支持 Windows、Linux 和 macOS 登录自启动。
-- 提供路由检查、当前状态、实时日志窗口和终端日志跟踪。
+- 提供路由检查、分类状态、实时日志搜索、按使用日保留日志和终端日志跟踪。
 - 支持 Windows、Linux、macOS 的 amd64 和 arm64 构建。
 
 hellogrok 是 Grok Build 渠道代理，不是系统代理、PAC 服务、VPN 或通用 HTTPS 拦截工具。
@@ -85,15 +87,15 @@ hellogrok 是 Grok Build 渠道代理，不是系统代理、PAC 服务、VPN �
 
 | 设置 | 搜索行为 |
 |------|----------|
-| 设置了 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` | 所有自定义对话渠道都通过已选搜索模型使用 Grok Build 客户端 `web_search`。环境变量优先于配置文件的值。 |
-| 未设置搜索模型，`supports_backend_search = true` | 上游端点支持时，由当前渠道使用自身的 hosted Web search。 |
-| 未设置搜索模型，`supports_backend_search = false` | 存在有效 xAI 凭据时，Grok Build 可以使用官方客户端搜索回退。 |
-| 未设置搜索模型，Grok 中转缺省该字段 | hellogrok 启动时自动检测中转的 hosted 搜索能力；确认支持则使用中转的 hosted search，否则保留 Grok Build 官方客户端搜索回退。 |
-| 未设置搜索模型，其他自定义渠道缺省该字段 | 可用时使用 Grok Build 官方客户端搜索回退。 |
+| 设置了 `[models].web_search` 或 `GROK_WEB_SEARCH_MODEL` | 所有自定义对话渠道都通过已选搜索模型使用 Grok Build 客户端 `web_search`。该搜索模型可采用 `responses`、`messages` 或 `chat_completions`，客户端搜索请求独立于 `supports_backend_search` 处理。环境变量优先于配置文件的值；选择过程只做本地解析，启动时不会请求所选渠道。 |
+| 未设置搜索模型，`supports_backend_search = true` | hellogrok 直接信任该声明，由当前渠道执行自身的 hosted Web search。 |
+| 未设置搜索模型，`supports_backend_search = false` 或缺省 | 使用 Grok Build 客户端搜索路径；存在有效 xAI 凭据时可使用官方搜索回退。 |
 | 没有可用的 hosted 或客户端搜索路径 | 当前模型无法使用 `web_search`。 |
 | `web_fetch` | 独立于搜索模型选择，并受当前工具权限限制。 |
 
-hellogrok 不会创建、选择或替换 `[models].web_search`。未选择客户端搜索模型时，渠道显式设置的 `true` 或 `false` 始终优先生效。
+hellogrok 不会创建、选择或替换 `[models].web_search`。代理启动时不会向任何上游发送搜索能力探测请求：显式 `true` 直接信任，`false` 与缺省等价。若上游实际上不支持所声明的 hosted 搜索，错误会在首次真实搜索请求时返回并写入日志，而不会拖慢代理启动。
+
+对于客户端搜索，hellogrok 只会向上游模型明确说明工具用途，不会根据提示词推断或强制调用工具。必须调用某个工具时，只以 Grok Build 或其他调用方提供的结构化 `tool_choice` 为准。内部传输别名只在协议中的工具名称字段内还原，不会改写响应正文、URL 或工具参数。
 
 ### 配置示例
 
@@ -123,12 +125,14 @@ supports_backend_search = false
 | `api_key` | 三选一 | 无 | 静态渠道凭据；共享配置建议优先使用 `env_key`。 |
 | `env_key` | 三选一 | 无 | 保存渠道凭据的环境变量名或按顺序尝试的名称列表。 |
 | `auth_provider` | 三选一 | 无 | Grok 命令式鉴权提供器。 |
-| `auth_scheme` | 否 | 随后端确定 | 上游鉴权方式，包括 Bearer 和 `X-Api-Key` 风格。 |
+| `auth_scheme` | 否 | `bearer` | 上游鉴权方式；只有服务商明确要求 `X-Api-Key` 时才设置为 `x_api_key`。 |
 | `extra_headers` | 否 | 空 | 额外的渠道自有 HTTP 请求头。 |
 | `env_http_headers` | 否 | 空 | 从环境变量读取的 HTTP 请求头。 |
-| `supports_backend_search` | 否 | 自动 | 选择 hosted search（`true`）或 Grok Build 客户端搜索（`false`）；缺省时允许 hellogrok 在启动时检测 Grok 中转。 |
+| `supports_backend_search` | 否 | `false` | 选择 hosted search（`true`）或 Grok Build 客户端搜索（`false`）；缺省按 `false` 处理。 |
 
 模型设置可以直接写在 `[model.<id>]` 下，也可以从引用的 `[model_providers.<id>]` 继承；模型级设置优先。
+
+渠道 ID 含点号时，推荐按 TOML 语法引用完整 ID，例如 `[model."provider.v1-beta"]`。连字符不需要引用。`name = "Provider.v1-beta"` 只是显示名称，点号和连字符均可直接使用。hellogrok 也会在代理运行期间兼容旧的未引用点号表头，并在停止时恢复原文。
 
 不要手动把自定义渠道 URL 设置成 hellogrok 的本地地址。本地临时 URL 只应由应用在代理运行期间管理。
 
@@ -140,7 +144,7 @@ supports_backend_search = false
 - 每个自定义渠道均有有效的凭据来源。
 - 从源码编译需要 Go **1.26.5**。
 
-当前实测基线为 Grok Build **0.2.118**。Grok Build 的自定义模型行为可能继续变化，使用更新版本时应运行仓库内的冒烟测试。
+当前实测基线为 Grok Build **1.0.0**。Grok Build 的自定义模型行为可能继续变化，使用更新版本时应运行仓库内的冒烟测试。
 
 可以通过 `GROK_HOME` 指定 `~/.grok` 以外的 Grok 配置目录。
 
@@ -154,7 +158,7 @@ cd hellogrok
 .\dist\hellogrok.exe
 ```
 
-通过托盘菜单选择“启动代理”，然后新开一个 Grok Build 进程，使其重新读取已准备的模型配置。
+通过托盘菜单选择“启动代理”。新开的 Grok Build 进程会直接读取代理配置；已经打开且连接共享 leader 的空闲自定义模型会话会自动热切换。
 
 ### Linux 或 macOS
 
@@ -172,7 +176,7 @@ CGO_ENABLED=0 go build -trimpath -o dist/hellogrok ./cmd/hellogrok
 ### 首次使用检查
 
 1. 执行 `hellogrok routes`，确认需要使用的自定义模型均已列出，后端和鉴权来源正确。
-2. 启动 hellogrok 后再新开 Grok Build 进程。
+2. 启动 hellogrok；若 Grok Build 已打开，查看状态或日志中的共享 leader 热切换结果。
 3. 使用 `/model` 切换模型并测试普通对话。
 4. 根据当前搜索模式分别测试 `web_search` 和 `web_fetch`。
 5. 正常停止 hellogrok，确认 Grok Build 配置不再指向本地代理。
@@ -210,6 +214,8 @@ Windows 托盘程序和可选 Unix 托盘版提供：
 
 同一登录会话只运行一个托盘实例；再次打开会直接退出，不会创建第二个托盘。托盘记忆状态与前台运行的 `hellogrok start` 命令相互独立。
 
+Windows 的“状态与日志”分割工具条提供自动清理天数选择和日志搜索。保留天数按 hellogrok 实际写过日志的不同日期计数，而不是按连续自然日计数；默认保留最近 7 个使用日，可选关闭、3、7、14、30。清理在下次启动应用时执行。重复点击“搜索”会跳到下一处匹配并在末尾回到开头。状态文本自动换行，原始日志行保持不换行，便于逐行检查。
+
 **退出保护：** 当供应商管理工具仍持有 Grok Build 配置所有权时，托盘会推迟退出以避免留下孤立代理地址——先解决配置冲突再退出。
 
 ### 与 CC Switch 兼容
@@ -246,6 +252,8 @@ Windows 托盘程序和可选 Unix 托盘版提供：
 | Linux 和 macOS | `~/.hellogrok` |
 
 运行数据包括应用偏好、日志以及用于恢复代理管理配置的恢复状态。
+
+日志保留规则在所有平台生效。原生下拉框和窗口内搜索目前仅适用于 Windows，因为标准 Linux 与 macOS 构建使用终端日志视图，没有对应的 Win32 状态窗口。
 
 ## 开机启动
 
@@ -298,11 +306,29 @@ Configured custom API channel
 
 ### 无法使用 `web_search`
 
-查看启动日志中的搜索路由。hosted 渠道需要上游返回真实搜索证据；客户端搜索路径需要有效的 `[models].web_search` 模型或可用的 xAI 官方凭据。`web_fetch` 与搜索模型独立，但仍可能被当前工具权限排除。
+先查看启动日志中的配置搜索路由，再检查首次失败的真实搜索请求。设置 `supports_backend_search = true` 的渠道必须实际实现 hosted 搜索；hellogrok 信任该设置，不会预先请求验证。客户端搜索路径需要有效的 `[models].web_search` 模型或可用的 xAI 官方凭据。`web_fetch` 与搜索模型独立，但仍可能被当前工具权限排除。
 
 ### 请求返回 401、403 或 502
 
 执行 `hellogrok routes` 并查看“状态与日志”，确认渠道 URL、后端、凭据来源、模型标识和服务商状态。上游故障、限流、不支持的载荷或被中转丢弃的搜索工具需要由服务商或中转解决。
+
+502 也可能表示上游返回了结构不完整的成功响应。hellogrok 会在转发前校验 Responses、Messages 或 Chat Completions 的最小响应结构，日志会指出缺失或类型错误的字段。
+
+渠道 ID 含点号时优先使用 `[model."完整.ID"]`。未引用的 `[model.foo.bar]` 会被 TOML 解析成嵌套表，Grok Build 原本只看到 `foo`；hellogrok 启用后会临时规范化并验证该表头。`name` 中的点号或连字符不会参与鉴权。
+
+### 输出最后一次性出现
+
+对于 Grok Build 的流式请求，hellogrok 会向三类受支持后端都发送 `stream=true`。Responses SSE 逐帧透传，Messages 与 Chat Completions SSE 逐帧转换。如果日志出现 `ignored stream=true; emitting buffered JSON fallback`，说明该上游返回的是一次性完整 JSON，本次请求客观上无法实现真正流式。代理仍会生成协议兼容的 SSE，但会明确标记这是缓冲回退，而不是伪装成上游流式。
+
+当前 Grok Build 有两条来源路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用；两者显示的都是唯一域名数，不是原始链接条数。对于 `responses`、`messages` 和 `chat_completions` 渠道，hellogrok 都会把同一批已验证 URL 写入两种表示，优先使用结构化结果和引用；只有响应已独立证明确实执行搜索时，才会从最终回答恢复有效 HTTP(S) 链接。普通回答中的链接不会凭空创建搜索调用。若供应商在整个响应中都不返回任何真实 URL，可以显示搜索活动，但不能伪造可信的站点数量。
+
+### Claude Messages 渠道选错模型或返回 404
+
+请使用复数写法 `api_backend = "messages"`。Grok Build 当前源码只定义 `chat_completions`、`responses`、`messages` 三种后端，Claude 本身受 Messages 后端支持。hellogrok 启用时会兼容历史单数值 `message`，但不经过 hellogrok 直接连接时仍必须使用官方复数写法。`base_url` 必须填写追加 `/messages` 之前的 API 根地址：若真实端点是 `/v1/messages`，配置应以 `/v1` 结尾，因为 hellogrok 会追加 `/messages`；上游成功返回 `text/html` 通常说明缺少这一 API 前缀。同时确认 `model` 填写的是服务商实际支持的 Claude 上游模型 ID，而不是渠道 ID。
+
+### 已打开窗口没有随代理切换
+
+查看“状态与日志”中的“Grok 会话热切换”。自动热切换只适用于共享 leader 中的空闲自定义模型会话，并兼容新旧 ACP 模型切换方法。Windows 上若 Grok Build 1.0.0 把活动的命名管道 leader 误报为 stale，hellogrok 只会在其 leader 锁确实被占用时接管。正在生成或等待输入的会话会被安全跳过；完成当前操作后在 `/model` 中重新选择当前模型。使用 `--no-leader` 打开的窗口没有可供 hellogrok 连接的外部 IPC，也需要手动重选或新开窗口。
 
 ### 强制退出后配置仍指向 localhost
 
@@ -310,7 +336,7 @@ Configured custom API channel
 
 ### 端口 `18787` 已占用
 
-启动新实例前先停止现有 hellogrok。同一份 Grok 配置目录只能由一个实例管理。
+启用代理前先停止占用 `127.0.0.1:18787` 的进程。hellogrok 会先占用端口再修改 Grok 配置；端口不可用时直接显示启动错误。它不会静默改用随机端口，因为临时渠道地址与恢复状态必须使用同一地址。
 
 ### 开机启动成功，但渠道没有凭据
 
@@ -345,6 +371,7 @@ CI 会在 Windows、Linux、Intel macOS 和 Apple Silicon macOS 上运行测试�
 
 - hellogrok 无法创造服务商侧的搜索能力；hosted search 渠道必须真实支持搜索并返回结果。
 - 中转如果主动删除工具声明、工具调用、引用或结果事件，下游无法完整恢复。
+- 供应商若无视 `stream=true`，等完整 JSON 已经返回后无法再变成真正流式；hellogrok 会记录并使用缓冲兼容回退。
 - 超出受支持 Responses、Chat Completions 和 Messages 格式的服务商私有扩展可能需要单独适配。
 - 上游可用性、模型权限、账号池、限流和网关错误仍由服务商负责。
 - 可选 Unix 托盘依赖已安装的桌面环境；标准 Unix CLI 是更通用的使用方式。

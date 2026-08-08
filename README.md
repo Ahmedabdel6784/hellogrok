@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.1-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.2-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -47,13 +47,15 @@ It is intended for users who maintain multiple third-party model channels and wa
 ### Channel compatibility
 
 - Supports upstream `responses`, `chat_completions`, and Anthropic-compatible `messages` APIs.
-- Normalizes supported responses and streams into a form Grok Build can consume.
+- Accepts legacy singular `message` as a hellogrok compatibility alias; Grok Build configuration should still use the official `messages` spelling.
+- Passes through Responses SSE and incrementally translates Messages and Chat Completions SSE, including reasoning, text, function arguments, hosted-search activity, and terminal errors.
 - Preserves each configured upstream URL path and model identifier.
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
 
 ### Native Web tools
 
 - Supports Grok Build's native `web_search` workflow for hosted and client-search modes.
+- Preserves real search URLs from every supported upstream protocol in both `web_search_call.action.sources` and `output_text.annotations`, including valid final-answer links when the response independently confirms that search ran. This lets current Grok Build versions display their native deduplicated site count for both hosted and client search.
 - Keeps `web_fetch` available as an independent tool when allowed by the active agent configuration.
 - Applies the same search behavior to supported subagents.
 - Keeps official Grok models on Grok Build's native search and login path.
@@ -72,7 +74,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Remembers the user's proxy-enabled choice between tray launches.
 - Defaults to proxy-enabled on first launch so new users see a working proxy immediately.
 - Includes login autostart controls for Windows, Linux, and macOS.
-- Provides route inspection, current status, a live log window, and terminal log following.
+- Provides route inspection, grouped status, live log search, usage-day log retention, and terminal log following.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
 hellogrok is a Grok Build channel proxy. It is not a system proxy, PAC service, VPN, or general HTTPS interceptor.
@@ -85,15 +87,15 @@ Search behavior follows the explicit search-model selection first, then the sele
 
 | Setting | Search behavior |
 |---------|-----------------|
-| `[models].web_search` or `GROK_WEB_SEARCH_MODEL` is set | All custom conversation channels use Grok Build client `web_search` through the selected search model. The environment variable takes precedence over the config file value. |
-| No search model, `supports_backend_search = true` | The selected channel uses its own hosted Web search when its upstream endpoint supports it. |
-| No search model, `supports_backend_search = false` | Grok Build uses its official client-search fallback when valid xAI credentials are available. |
-| No search model, setting omitted on a Grok relay | hellogrok auto-detects the relay's hosted search capability at startup; confirmed hosted search uses the relay, otherwise Grok Build keeps its official client-search fallback. |
-| No search model, setting omitted on another custom channel | Grok Build uses its official client-search fallback when available. |
+| `[models].web_search` or `GROK_WEB_SEARCH_MODEL` is set | All custom conversation channels use Grok Build client `web_search` through the selected search model. That search model may use `responses`, `messages`, or `chat_completions`; its client-search request is handled independently of `supports_backend_search`. The environment variable takes precedence over the config file value. The selection is resolved locally without a startup request to the selected channel. |
+| No search model, `supports_backend_search = true` | hellogrok trusts the declaration and lets the selected channel execute its own hosted Web search. |
+| No search model, `supports_backend_search = false` or omitted | Grok Build uses its client-search path, including its official fallback when valid xAI credentials are available. |
 | No usable hosted or client search path | `web_search` is unavailable for that model. |
 | `web_fetch` | Remains independent of the search-model selection and follows the active tool permissions. |
 
-hellogrok never creates, selects, or replaces `[models].web_search`. Explicit `true` and `false` channel settings remain authoritative when no client search model is selected.
+hellogrok never creates, selects, or replaces `[models].web_search`. Proxy startup sends no search-capability probes to upstream channels: explicit `true` is trusted, while `false` and an omitted setting are equivalent. If an upstream does not actually support the declared hosted-search behavior, the error is returned and logged on the first real search request instead of delaying startup.
+
+For client search, hellogrok clarifies tool descriptions for upstream models but never infers or forces tool use from prompt text. Mandatory selection comes only from the structured `tool_choice` supplied by Grok Build or another caller. Internal wire aliases are restored only in protocol tool-name fields, so response text, URLs, and tool arguments remain unchanged.
 
 ### Example configuration
 
@@ -123,12 +125,14 @@ Set `supports_backend_search = true` instead when that channel should execute it
 | `api_key` | One auth method | None | Static channel credential. Prefer `env_key` for shared configurations. |
 | `env_key` | One auth method | None | Environment variable name or ordered list of names containing the channel credential. |
 | `auth_provider` | One auth method | None | Grok command-based authentication provider. |
-| `auth_scheme` | No | Backend-dependent | Upstream authentication scheme, including Bearer and `X-Api-Key` styles. |
+| `auth_scheme` | No | `bearer` | Upstream authentication scheme. Set `x_api_key` only for providers that explicitly require `X-Api-Key`. |
 | `extra_headers` | No | Empty | Additional channel-owned HTTP headers. |
 | `env_http_headers` | No | Empty | HTTP headers populated from environment variables. |
-| `supports_backend_search` | No | Automatic | Selects hosted search (`true`) or Grok Build client search (`false`); an omitted value lets hellogrok check Grok relays at startup. |
+| `supports_backend_search` | No | `false` | Selects hosted search (`true`) or Grok Build client search (`false`); an omitted value is treated as `false`. |
 
 Model settings may be declared directly under `[model.<id>]` or inherited from a referenced `[model_providers.<id>]`. Model-level values take precedence.
+
+Quote the full ID when a channel ID contains a dot, for example `[model."provider.v1-beta"]`. Dashes do not require quoting. A value such as `name = "Provider.v1-beta"` is display-only and may use dots or dashes directly. While active, hellogrok also accepts a legacy unquoted dotted header and restores the original text on stop.
 
 Do not manually set a custom channel URL to hellogrok's local address. The application manages temporary local URLs only while the proxy is active.
 
@@ -140,7 +144,7 @@ Do not manually set a custom channel URL to hellogrok's local address. The appli
 - A valid credential source for every custom channel.
 - Go **1.26.5** when building from source.
 
-Grok Build **0.2.118** is the current verified baseline. Newer versions should be checked with the included smoke tests because Grok Build's custom-model behavior may evolve.
+Grok Build **1.0.0** is the current verified baseline. Newer versions should be checked with the included smoke tests because Grok Build's custom-model behavior may evolve.
 
 Set `GROK_HOME` to use a Grok configuration directory other than `~/.grok`.
 
@@ -154,7 +158,7 @@ cd hellogrok
 .\dist\hellogrok.exe
 ```
 
-Use the tray menu to select **Start proxy**. Then start a new Grok Build process so it reloads the prepared model configuration.
+Use the tray menu to select **Start proxy**. New Grok Build processes read the proxy configuration directly; idle custom-model sessions already attached to a shared leader are hot-switched automatically.
 
 ### Linux or macOS
 
@@ -172,7 +176,7 @@ Expected startup output includes a local channel endpoint and a successful confi
 ### First-use checklist
 
 1. Run `hellogrok routes` and confirm every intended custom model is listed with the correct backend and an available authentication source.
-2. Start hellogrok before opening a new Grok Build process.
+2. Start hellogrok. If Grok Build is already open, inspect the shared-leader hot-switch result in status or logs.
 3. Switch models with `/model` and test a normal conversation.
 4. Test `web_search` and `web_fetch` separately according to the selected search mode.
 5. Stop hellogrok normally and confirm Grok Build's configuration no longer points to the local proxy.
@@ -210,6 +214,8 @@ The Windows tray application and optional Unix tray build provide:
 
 Only one tray instance runs in a login session; launching it again exits immediately instead of creating a second tray. The remembered tray state is independent from the foreground `hellogrok start` command.
 
+On Windows, the divider in **Status and logs** contains a retention selector and log search. Retention counts distinct dates on which hellogrok actually wrote logs rather than elapsed calendar days; the default keeps the latest 7 usage days, with `off`, 3, 7, 14, and 30 available. Cleanup runs at the next application start. Repeated **Search** clicks move to the next match and wrap to the beginning. Status text wraps; raw log lines remain unwrapped for reliable scanning.
+
 **Quit protection**: When a provider manager still owns Grok Build's configuration, the tray defers exit to avoid leaving an orphaned proxy route — resolve the configuration conflict first, then quit.
 
 ### Compatibility with CC Switch
@@ -246,6 +252,8 @@ If both Grok proxies were enabled accidentally, disable CC Switch's Grok Build t
 | Linux and macOS | `~/.hellogrok` |
 
 Runtime data contains application preferences, logs, and the recovery state used to restore managed configuration.
+
+Log retention is applied on every platform. The native retention selector and in-window search are currently Windows-only because the standard Linux and macOS builds use terminal log viewing instead of the Win32 status window.
 
 ## Autostart
 
@@ -298,11 +306,29 @@ Confirm that the intended `[model.<id>]` or referenced provider has a valid `bas
 
 ### `web_search` is unavailable
 
-Check the startup log for the selected search route. A hosted channel needs real upstream search evidence. A client-search route needs either a valid `[models].web_search` model or usable official xAI credentials. `web_fetch` is independent but can still be removed by the active tool permissions.
+Check the startup log for the configured search route, then inspect the first failing search request. A channel with `supports_backend_search = true` must actually implement hosted search; hellogrok trusts this setting and does not preflight it. A client-search route needs either a valid `[models].web_search` model or usable official xAI credentials. `web_fetch` is independent but can still be removed by the active tool permissions.
 
 ### A request returns 401, 403, or 502
 
 Run `hellogrok routes` and inspect **Status and logs**. Confirm the channel URL, backend, credential source, model identifier, and provider availability. An upstream outage, rate limit, unsupported payload, or stripped search tool must be fixed by the provider or relay.
+
+A 502 can also mean that an upstream returned a malformed success response. hellogrok validates the minimum Responses, Messages, or Chat Completions envelope before forwarding it; the log identifies the missing or invalid field.
+
+Prefer `[model."full.ID"]` when a channel ID contains dots. TOML interprets an unquoted `[model.foo.bar]` as nested tables, so Grok Build originally sees only `foo`; hellogrok temporarily normalizes and validates that header while enabled. Dots or dashes in `name` do not participate in authentication.
+
+### Output arrives all at once
+
+For a streaming Grok Build request, hellogrok sends `stream=true` to every supported backend. Responses SSE is forwarded frame by frame; Messages and Chat Completions SSE is converted frame by frame. If the log says `ignored stream=true; emitting buffered JSON fallback`, that upstream returned one complete JSON response, so true streaming is impossible for that request. The fallback remains protocol-compatible but is intentionally reported as buffered rather than presented as upstream streaming.
+
+Current Grok Build has two source paths: hosted search reads `web_search_call.action.sources`, while its client `web_search` tool reads URL citations from `output_text.annotations`. Both render unique domains rather than raw URL count. For `responses`, `messages`, and `chat_completions` channels alike, hellogrok writes the same verified URLs to both forms, first using structured results and citations and, only when search execution is independently confirmed, recovering valid HTTP(S) links from the final answer. A normal answer link does not create a search call. If a provider returns no real URL anywhere, search activity can still be shown but a trustworthy site count cannot be fabricated.
+
+### A Claude Messages channel selects the wrong model or returns 404
+
+Use `api_backend = "messages"` (plural). Grok Build's current source defines only `chat_completions`, `responses`, and `messages`; Claude is supported through the Messages backend. hellogrok accepts the historical singular `message` value while enabled, but a direct Grok Build connection still requires the official plural spelling. `base_url` must be the API root before `/messages`: for an endpoint at `/v1/messages`, configure a URL ending in `/v1`, because hellogrok appends `/messages`. A successful `text/html` response usually means this API prefix is missing. Also ensure `model` is the provider's actual upstream Claude model ID rather than the channel ID.
+
+### An open window did not follow the proxy switch
+
+Check the **Grok session hot switch** line in **Status and logs**. Automatic switching applies to idle custom-model sessions on a shared leader and supports both current and legacy ACP model-switch method names. On Windows, a live named-pipe leader misreported as stale by Grok Build 1.0.0 is accepted only when its leader lock is actively held. A working or input-blocked session is skipped safely; reselect its current model in `/model` after the active operation finishes. A window started with `--no-leader` exposes no external IPC to hellogrok and also requires manual reselection or a new window.
 
 ### The configuration still points to localhost after a forced exit
 
@@ -310,7 +336,7 @@ Ensure no hellogrok process is running, then execute `hellogrok restore`. Do not
 
 ### Port `18787` is already in use
 
-Stop the existing hellogrok instance before starting another one. Only one instance should manage a Grok configuration directory at a time.
+Stop the process that owns `127.0.0.1:18787` before enabling the proxy. hellogrok claims the port before changing Grok configuration and shows a startup error if it is unavailable; it does not silently switch ports because the rewritten channel URLs and recovery state must agree on one address.
 
 ### Autostart works, but a channel has no credentials
 
@@ -345,6 +371,7 @@ CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silic
 
 - hellogrok cannot create provider-side search capability. A hosted-search channel must actually support search and return its results.
 - A relay that removes tool declarations, tool calls, citations, or result events cannot be fully repaired downstream.
+- A provider that ignores `stream=true` cannot be made truly streaming after its complete JSON response has already arrived; hellogrok logs and uses a buffered compatibility fallback.
 - Provider-specific API extensions outside the supported Responses, Chat Completions, and Messages formats may require additional adaptation.
 - Upstream availability, model access, account pools, rate limits, and gateway errors remain the provider's responsibility.
 - Optional Unix tray behavior depends on the installed desktop environment; the standard Unix CLI is the portable path.

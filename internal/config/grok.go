@@ -22,7 +22,6 @@ type Model struct {
 	APIBaseURL            string
 	APIBackend            string
 	SupportsBackendSearch bool
-	BackendSearchSet      bool
 	AuthScheme            string
 	IncomingAuthScheme    string
 	APIKey                string
@@ -75,18 +74,6 @@ type Route struct {
 	// declaration for this channel. False keeps Build's client web_search path
 	// intact for an explicit search model or Build's authenticated default.
 	SupportsBackendSearch bool
-	// BackendSearchSet distinguishes a user/provider declaration from Build's
-	// false default. Missing values are eligible for runtime capability probing.
-	BackendSearchSet bool
-	// HostedSearchKnown makes the two capability bits authoritative. When false,
-	// an explicit supports_backend_search=true declaration keeps the historical
-	// provider-specific defaults until a probe supplies a finer result.
-	HostedSearchKnown bool
-	HostedWebSearch   bool
-	HostedXSearch     bool
-	// HostedChatSearchDialect is discovered at runtime and never written to the
-	// Grok configuration. It is empty for non-Chat routes or unknown providers.
-	HostedChatSearchDialect ChatSearchDialect
 }
 
 // WebSearchSelection is an explicitly selected Build client-search model.
@@ -125,8 +112,8 @@ func LoadModels(path string) ([]Model, error) {
 	if err := toml.Unmarshal(raw, &root); err != nil {
 		return nil, fmt.Errorf("parse toml: %w", err)
 	}
-	modelTable, _ := root["model"].(map[string]any)
-	if modelTable == nil {
+	modelTable := cfgpatch.ModelTables(root)
+	if len(modelTable) == 0 {
 		return nil, nil
 	}
 	providerTable, _ := root["model_providers"].(map[string]any)
@@ -146,18 +133,14 @@ func LoadModels(path string) ([]Model, error) {
 	sort.Strings(ids)
 	var out []Model
 	for _, id := range ids {
-		v := modelTable[id]
-		m, ok := v.(map[string]any)
-		if !ok {
-			continue
-		}
+		m := modelTable[id]
 		providerID := strings.TrimSpace(str(m["model_provider"]))
 		provider, _ := providerTable[providerID].(map[string]any)
 
 		baseURL := inheritedString(m, provider, "base_url")
 		apiBaseURL := inheritedString(m, provider, "api_base_url")
-		apiBackend := strings.ToLower(inheritedString(m, provider, "api_backend"))
-		supportsBackendSearch, backendSearchSet, err := inheritedBool(m, provider, "supports_backend_search")
+		apiBackend := normalizeAPIBackend(inheritedString(m, provider, "api_backend"))
+		supportsBackendSearch, err := inheritedBool(m, provider, "supports_backend_search")
 		if err != nil {
 			return nil, fmt.Errorf("[model.%s].supports_backend_search %w", id, err)
 		}
@@ -213,7 +196,6 @@ func LoadModels(path string) ([]Model, error) {
 			APIBaseURL:            apiBaseURL,
 			APIBackend:            apiBackend,
 			SupportsBackendSearch: supportsBackendSearch,
-			BackendSearchSet:      backendSearchSet,
 			AuthScheme:            upstreamAuthScheme,
 			IncomingAuthScheme:    modelAuthScheme,
 			APIKey:                apiKey,
@@ -250,7 +232,7 @@ func inheritedString(model, provider map[string]any, key string) string {
 	return ""
 }
 
-func inheritedBool(model, provider map[string]any, key string) (bool, bool, error) {
+func inheritedBool(model, provider map[string]any, key string) (bool, error) {
 	for _, values := range []map[string]any{model, provider} {
 		if values == nil {
 			continue
@@ -261,11 +243,11 @@ func inheritedBool(model, provider map[string]any, key string) (bool, bool, erro
 		}
 		value, ok := raw.(bool)
 		if !ok {
-			return false, true, fmt.Errorf("must be a boolean")
+			return false, fmt.Errorf("must be a boolean")
 		}
-		return value, true, nil
+		return value, nil
 	}
-	return false, false, nil
+	return false, nil
 }
 
 // LoadWebSearchSelection resolves only explicit client-search choices. The
@@ -355,6 +337,14 @@ func normalizeAuthScheme(value string) string {
 	default:
 		return ""
 	}
+}
+
+func normalizeAPIBackend(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "message" {
+		return "messages"
+	}
+	return value
 }
 
 func envKeyList(v any) []string {
@@ -498,11 +488,7 @@ func BuildRoutes(models []Model) ([]Route, error) {
 		}
 		authScheme := m.AuthScheme
 		if authScheme == "" {
-			if backend == "messages" {
-				authScheme = "x_api_key"
-			} else {
-				authScheme = "bearer"
-			}
+			authScheme = "bearer"
 		}
 		out = append(out, Route{
 			ChannelID:             m.ID,
@@ -516,7 +502,6 @@ func BuildRoutes(models []Model) ([]Route, error) {
 			DynamicAuth:           m.DynamicAuth && key == "",
 			ExtraHeaders:          resolveExtraHeaders(m),
 			SupportsBackendSearch: m.SupportsBackendSearch,
-			BackendSearchSet:      m.BackendSearchSet,
 		})
 	}
 	return out, nil

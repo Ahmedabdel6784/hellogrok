@@ -8,12 +8,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/hellowind777/hellogrok/internal/config"
 )
+
+const maxBackfilledSearchSources = 100
+
+var httpURLInTextPattern = regexp.MustCompile(`https?://[^\s<>"'()\[\]{}]+`)
 
 type canonicalResult struct {
 	Output           []any
@@ -24,15 +30,19 @@ type canonicalResult struct {
 	IncompleteReason string
 }
 
-func canonicalFromMessages(data []byte) (canonicalResult, error) {
+func canonicalFromMessages(data []byte, hosted bool, query string) (canonicalResult, error) {
 	root, err := decodeJSONMap(data)
 	if err != nil {
+		return canonicalResult{}, err
+	}
+	if err := validateMessagesEnvelope(root); err != nil {
 		return canonicalResult{}, err
 	}
 	var result canonicalResult
 	webCalls := map[string]map[string]any{}
 	var textParts []string
 	var annotations []any
+	var evidenceURLs []string
 	flushText := func() {
 		if len(textParts) == 0 {
 			return
@@ -81,6 +91,7 @@ func canonicalFromMessages(data []byte) (canonicalResult, error) {
 		case "text":
 			textParts = append(textParts, stringValue(block["text"]))
 			annotations = append(annotations, citationsToAnnotations(block["citations"])...)
+			evidenceURLs = mergeUniqueStrings(evidenceURLs, urlsFromJSON(block["citations"])...)
 		}
 	}
 	flushText()
@@ -92,6 +103,20 @@ func canonicalFromMessages(data []byte) (canonicalResult, error) {
 	if stringValue(root["stop_reason"]) == "max_tokens" {
 		result.IncompleteReason = "max_output_tokens"
 	}
+	if hosted && len(webCalls) == 0 && (len(evidenceURLs) > 0 || positiveSearchUsage(root["usage"])) {
+		search := webSearchItem("", query, urlsToSources(evidenceURLs), "completed")
+		insertAt := len(result.Output)
+		for index, raw := range result.Output {
+			item, _ := raw.(map[string]any)
+			if stringValue(item["type"]) == "message" {
+				insertAt = index
+				break
+			}
+		}
+		result.Output = append(result.Output, nil)
+		copy(result.Output[insertAt+1:], result.Output[insertAt:])
+		result.Output[insertAt] = search
+	}
 	return result, nil
 }
 
@@ -101,11 +126,14 @@ func canonicalFromChat(data []byte, hosted bool, query string) (canonicalResult,
 		return canonicalResult{}, err
 	}
 	var result canonicalResult
-	choices := anySlice(root["choices"])
-	if len(choices) == 0 {
+	choices, ok := root["choices"].([]any)
+	if !ok || len(choices) == 0 {
 		return result, fmt.Errorf("chat completions response has no choices")
 	}
-	choice, _ := choices[0].(map[string]any)
+	choice, ok := choices[0].(map[string]any)
+	if !ok || choice == nil {
+		return result, fmt.Errorf("chat completions response choice[0] must be an object")
+	}
 	message, _ := choice["message"].(map[string]any)
 	if message == nil {
 		return result, fmt.Errorf("chat completions response has no message")
@@ -144,6 +172,98 @@ func canonicalFromChat(data []byte, hosted bool, query string) (canonicalResult,
 		result.IncompleteReason = "max_output_tokens"
 	}
 	return result, nil
+}
+
+func validateResponsesEnvelope(root map[string]any) error {
+	if strings.TrimSpace(stringValue(root["id"])) == "" {
+		return fmt.Errorf("Responses response id must be a non-empty string")
+	}
+	if stringValue(root["object"]) != "response" {
+		return fmt.Errorf("Responses response object must be %q", "response")
+	}
+	if strings.TrimSpace(stringValue(root["status"])) == "" {
+		return fmt.Errorf("Responses response status must be a non-empty string")
+	}
+	output, ok := root["output"].([]any)
+	if !ok {
+		return fmt.Errorf("Responses response output must be an array")
+	}
+	for index, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok || item == nil {
+			return fmt.Errorf("Responses response output[%d] must be an object", index)
+		}
+		switch stringValue(item["type"]) {
+		case "message":
+			content, ok := item["content"].([]any)
+			if !ok {
+				return fmt.Errorf("Responses response output[%d].content must be an array", index)
+			}
+			for contentIndex, rawPart := range content {
+				if part, ok := rawPart.(map[string]any); !ok || part == nil {
+					return fmt.Errorf("Responses response output[%d].content[%d] must be an object", index, contentIndex)
+				}
+			}
+		case "reasoning":
+			rawContent, exists := item["content"]
+			if !exists || rawContent == nil {
+				continue
+			}
+			content, ok := rawContent.([]any)
+			if !ok {
+				return fmt.Errorf("Responses response output[%d].content must be an array when present", index)
+			}
+			for contentIndex, rawPart := range content {
+				if part, ok := rawPart.(map[string]any); !ok || part == nil {
+					return fmt.Errorf("Responses response output[%d].content[%d] must be an object", index, contentIndex)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateMessagesEnvelope(root map[string]any) error {
+	for _, field := range []string{"id", "model"} {
+		if strings.TrimSpace(stringValue(root[field])) == "" {
+			return fmt.Errorf("Messages response %s must be a non-empty string", field)
+		}
+	}
+	if stringValue(root["type"]) != "message" {
+		return fmt.Errorf("Messages response type must be %q", "message")
+	}
+	if stringValue(root["role"]) != "assistant" {
+		return fmt.Errorf("Messages response role must be %q", "assistant")
+	}
+	content, ok := root["content"].([]any)
+	if !ok {
+		return fmt.Errorf("Messages response content must be an array")
+	}
+	for index, raw := range content {
+		if block, ok := raw.(map[string]any); !ok || block == nil {
+			return fmt.Errorf("Messages response content[%d] must be an object", index)
+		}
+	}
+	if usage, ok := root["usage"].(map[string]any); !ok || usage == nil {
+		return fmt.Errorf("Messages response usage must be an object")
+	}
+	return nil
+}
+
+func validateResponsesEventPayload(data []byte) error {
+	event, err := decodeJSONMap(data)
+	if err != nil {
+		return err
+	}
+	value, exists := event["response"]
+	if !exists {
+		return nil
+	}
+	response, ok := value.(map[string]any)
+	if !ok || response == nil {
+		return fmt.Errorf("Responses event response must be an object")
+	}
+	return validateResponsesEnvelope(response)
 }
 
 // Chat Completions has no standard backend-tool-call item. Do not claim that a
@@ -210,6 +330,10 @@ func canonicalResponse(route config.Route, request facadeRequest, result canonic
 		incomplete = map[string]any{"reason": result.IncompleteReason}
 	}
 	total := result.InputTokens + result.OutputTokens
+	output := result.Output
+	if output == nil {
+		output = []any{}
+	}
 	return map[string]any{
 		"id":                     compatID("resp"),
 		"object":                 "response",
@@ -224,7 +348,7 @@ func canonicalResponse(route config.Route, request facadeRequest, result canonic
 		"max_tool_calls":         nil,
 		"metadata":               map[string]any{},
 		"model":                  route.WireModel,
-		"output":                 result.Output,
+		"output":                 output,
 		"parallel_tool_calls":    true,
 		"previous_response_id":   nil,
 		"prompt_cache_key":       nil,
@@ -266,6 +390,9 @@ func writeCanonicalResponse(w http.ResponseWriter, response map[string]any, stre
 	if response == nil {
 		return fmt.Errorf("response body must be a JSON object")
 	}
+	if err := validateResponsesEnvelope(response); err != nil {
+		return err
+	}
 	if _, err := json.Marshal(response); err != nil {
 		return fmt.Errorf("encode response: %w", err)
 	}
@@ -280,29 +407,7 @@ func writeCanonicalResponse(w http.ResponseWriter, response map[string]any, stre
 		_, _ = w.Write(data)
 		return nil
 	}
-	output, ok := response["output"].([]any)
-	if !ok {
-		return fmt.Errorf("response output must be an array")
-	}
-	for index, raw := range output {
-		item, ok := raw.(map[string]any)
-		if !ok || item == nil {
-			return fmt.Errorf("response output[%d] must be an object", index)
-		}
-		switch stringValue(item["type"]) {
-		case "message", "reasoning":
-			content, ok := item["content"].([]any)
-			if !ok {
-				return fmt.Errorf("response output[%d].content must be an array", index)
-			}
-			for contentIndex, rawPart := range content {
-				part, ok := rawPart.(map[string]any)
-				if !ok || part == nil {
-					return fmt.Errorf("response output[%d].content[%d] must be an object", index, contentIndex)
-				}
-			}
-		}
-	}
+	output := response["output"].([]any)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
@@ -539,6 +644,163 @@ func urlsToSources(urls []string) []any {
 		sources = append(sources, map[string]any{"type": "url", "url": rawURL})
 	}
 	return sources
+}
+
+// backfillResponseSearchSources supplies the URL list consumed by Grok Build's
+// native "(N sites)" renderer when an upstream confirms that search ran but
+// omits structured citations. Free-form links alone never create a search call.
+func backfillResponseSearchSources(response map[string]any, hosted bool, query string) bool {
+	output, ok := response["output"].([]any)
+	if !ok {
+		return false
+	}
+
+	var calls []map[string]any
+	var structuredURLs []string
+	var textURLs []string
+	firstMessage := len(output)
+	for index, raw := range output {
+		item, _ := raw.(map[string]any)
+		if item == nil {
+			continue
+		}
+		switch stringValue(item["type"]) {
+		case "web_search_call":
+			calls = append(calls, item)
+			if action, _ := item["action"].(map[string]any); action != nil {
+				structuredURLs = mergeUniqueStrings(structuredURLs, urlsFromJSON(action["sources"])...)
+			}
+		case "message":
+			if firstMessage == len(output) {
+				firstMessage = index
+			}
+			for _, rawPart := range anySlice(item["content"]) {
+				part, _ := rawPart.(map[string]any)
+				if part == nil || stringValue(part["type"]) != "output_text" {
+					continue
+				}
+				structuredURLs = mergeUniqueStrings(structuredURLs, urlsFromJSON(part["annotations"])...)
+				textURLs = mergeUniqueStrings(textURLs, urlsFromText(stringValue(part["text"]))...)
+			}
+		}
+	}
+
+	confirmed := len(calls) > 0 || (hosted && (len(structuredURLs) > 0 || positiveSearchUsage(response["usage"])))
+	if !confirmed {
+		return false
+	}
+	changed := false
+	if len(calls) == 0 {
+		call := webSearchItem("", query, nil, "completed")
+		output = append(output, nil)
+		copy(output[firstMessage+1:], output[firstMessage:])
+		output[firstMessage] = call
+		response["output"] = output
+		calls = append(calls, call)
+		changed = true
+	}
+
+	allURLs := mergeUniqueStrings(structuredURLs, textURLs...)
+	if len(allURLs) > maxBackfilledSearchSources {
+		allURLs = allURLs[:maxBackfilledSearchSources]
+	}
+	target := calls[len(calls)-1]
+	action, _ := target["action"].(map[string]any)
+	if action == nil {
+		action = map[string]any{"type": "search", "query": query, "sources": []any{}}
+		target["action"] = action
+	}
+	if strings.TrimSpace(stringValue(action["query"])) == "" {
+		action["query"] = query
+	}
+	if mergeResponseSearchURLs(response, allURLs) {
+		changed = true
+	}
+	// Grok Build has two search render paths. Native backend search reads
+	// action.sources, while its client-side web_search tool extracts only URL
+	// citations from output_text annotations. Mirror the same verified URLs to
+	// both representations so non-hosted model channels get the native site
+	// count too.
+	if mergeResponseCitationURLs(response, allURLs) {
+		changed = true
+	}
+	return changed
+}
+
+func mergeResponseSearchURLs(response map[string]any, urls []string) bool {
+	var target map[string]any
+	for _, raw := range anySlice(response["output"]) {
+		item, _ := raw.(map[string]any)
+		if item != nil && stringValue(item["type"]) == "web_search_call" {
+			target = item
+		}
+	}
+	if target == nil || len(urls) == 0 {
+		return false
+	}
+	action, _ := target["action"].(map[string]any)
+	before := len(anySlice(action["sources"]))
+	mergeWebSearchSources(target, urlsToSources(urls))
+	return len(anySlice(action["sources"])) > before
+}
+
+func mergeResponseCitationURLs(response map[string]any, urls []string) bool {
+	if len(urls) == 0 {
+		return false
+	}
+	seen := map[string]bool{}
+	var target map[string]any
+	for _, raw := range anySlice(response["output"]) {
+		item, _ := raw.(map[string]any)
+		if stringValue(item["type"]) != "message" {
+			continue
+		}
+		for _, rawPart := range anySlice(item["content"]) {
+			part, _ := rawPart.(map[string]any)
+			if stringValue(part["type"]) != "output_text" {
+				continue
+			}
+			if target == nil {
+				target = part
+			}
+			for _, rawURL := range urlsFromJSON(part["annotations"]) {
+				seen[rawURL] = true
+			}
+		}
+	}
+	if target == nil {
+		return false
+	}
+	missing := make([]string, 0, len(urls))
+	for _, rawURL := range urls {
+		if rawURL != "" && !seen[rawURL] {
+			seen[rawURL] = true
+			missing = append(missing, rawURL)
+		}
+	}
+	if len(missing) == 0 {
+		return false
+	}
+	target["annotations"] = mergeAnnotations(anySlice(target["annotations"]), urlsToAnnotations(missing))
+	return true
+}
+
+func urlsFromText(text string) []string {
+	seen := map[string]bool{}
+	urls := make([]string, 0)
+	for _, match := range httpURLInTextPattern.FindAllString(text, -1) {
+		candidate := strings.TrimRight(match, ".,;:!?`*_~")
+		parsed, err := url.Parse(candidate)
+		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		urls = append(urls, candidate)
+		if len(urls) == maxBackfilledSearchSources {
+			break
+		}
+	}
+	return urls
 }
 
 func decodeJSONMap(data []byte) (map[string]any, error) {

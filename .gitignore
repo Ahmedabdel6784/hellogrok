@@ -10,5 +10,25 @@ dist/
 .idea/
 .vscode/
 *.log
+
+# Local credentials and private runtime data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+credentials*.json
+secrets*.json
+!credentials.example.json
+!secrets.example.json
+/.grok/
+/.hellogrok/
+/config.toml
+/config_rewrite_state.json
+/settings.json
+
 # local only — committed syso under cmd/hellogrok are OK for PE icons
 # *.syso

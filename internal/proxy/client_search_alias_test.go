@@ -19,6 +19,10 @@ func TestClientSearchWireAliasAvoidsCollisionsAndLeavesHostedToolsUntouched(t *t
 				"type": "output_text",
 				"text": "Do not rewrite " + clientWebSearchWireAliasBase + "_20 because it is a different identifier.",
 			}},
+		}, map[string]any{
+			"type":      "function_call",
+			"name":      "write_file",
+			"arguments": `{"content":"hellogrok_web_search","url":"https://example.test/hellogrok_web_search?q=1"}`,
 		}},
 	}
 	alias := chooseClientWebSearchWireAlias(root)
@@ -44,11 +48,16 @@ func TestClientSearchWireAliasAvoidsCollisionsAndLeavesHostedToolsUntouched(t *t
 	}
 	output := anySlice(root["output"])[0].(map[string]any)
 	content := anySlice(output["content"])[0].(map[string]any)
-	if got := stringValue(content["text"]); got != "I used web_search to search." {
-		t.Fatalf("client alias leaked in user-visible text: %q", got)
+	if got := stringValue(content["text"]); got != "I used "+alias+" to search." {
+		t.Fatalf("user-visible text was rewritten: %q", got)
 	}
 	longerIdentifier := anySlice(output["content"])[1].(map[string]any)
 	if got := stringValue(longerIdentifier["text"]); got != "Do not rewrite "+clientWebSearchWireAliasBase+"_20 because it is a different identifier." {
 		t.Fatalf("longer identifier was corrupted: %q", got)
+	}
+	unrelatedCall := anySlice(root["output"])[1].(map[string]any)
+	wantArguments := `{"content":"hellogrok_web_search","url":"https://example.test/hellogrok_web_search?q=1"}`
+	if got := stringValue(unrelatedCall["arguments"]); got != wantArguments {
+		t.Fatalf("unrelated tool arguments were rewritten: %q", got)
 	}
 }

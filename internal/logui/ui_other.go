@@ -13,8 +13,15 @@ import (
 type StatusFunc func() (short, detail string)
 
 // Open falls back to a separate terminal logview on non-Windows.
-func Open(path string, status StatusFunc) error {
+func Open(
+	path string,
+	status StatusFunc,
+	getRetention func() (int, error),
+	setRetention func(int) error,
+) error {
 	_ = status
+	_ = getRetention
+	_ = setRetention
 	exe, err := os.Executable()
 	if err != nil {
 		return err

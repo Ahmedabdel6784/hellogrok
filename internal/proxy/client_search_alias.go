@@ -87,71 +87,32 @@ func restoreClientWebSearchAlias(value any, alias string) bool {
 	walk = func(current any) {
 		switch typed := current.(type) {
 		case map[string]any:
-			if strings.EqualFold(strings.TrimSpace(stringValue(typed["name"])), alias) {
+			typ := strings.ToLower(strings.TrimSpace(stringValue(typed["type"])))
+			_, messagesFunction := typed["input_schema"]
+			if (typ == "function" || typ == "function_call" || typ == "tool_use" ||
+				typ == "tool" || messagesFunction) &&
+				strings.EqualFold(strings.TrimSpace(stringValue(typed["name"])), alias) {
 				typed["name"] = "web_search"
 				changed = true
 			}
-			for key, child := range typed {
-				if text, ok := child.(string); ok {
-					if restored, restoredText := replaceIdentifier(text, alias, "web_search"); restoredText {
-						typed[key] = restored
-						changed = true
-					}
-					continue
+			if typ == "function" {
+				if function, _ := typed["function"].(map[string]any); function != nil &&
+					strings.EqualFold(strings.TrimSpace(stringValue(function["name"])), alias) {
+					function["name"] = "web_search"
+					changed = true
 				}
+			}
+			for _, child := range typed {
 				walk(child)
 			}
 		case []any:
-			for index, child := range typed {
-				if text, ok := child.(string); ok {
-					if restored, restoredText := replaceIdentifier(text, alias, "web_search"); restoredText {
-						typed[index] = restored
-						changed = true
-					}
-					continue
-				}
+			for _, child := range typed {
 				walk(child)
 			}
 		}
 	}
 	walk(value)
 	return changed
-}
-
-func replaceIdentifier(value, old, replacement string) (string, bool) {
-	searchFrom := 0
-	writtenThrough := 0
-	changed := false
-	var restored strings.Builder
-	for searchFrom < len(value) {
-		relative := strings.Index(value[searchFrom:], old)
-		if relative < 0 {
-			break
-		}
-		start := searchFrom + relative
-		end := start + len(old)
-		if (start > 0 && identifierByte(value[start-1])) || (end < len(value) && identifierByte(value[end])) {
-			searchFrom = end
-			continue
-		}
-		if !changed {
-			restored.Grow(len(value))
-		}
-		restored.WriteString(value[writtenThrough:start])
-		restored.WriteString(replacement)
-		writtenThrough = end
-		searchFrom = end
-		changed = true
-	}
-	if !changed {
-		return value, false
-	}
-	restored.WriteString(value[writtenThrough:])
-	return restored.String(), true
-}
-
-func identifierByte(value byte) bool {
-	return value == '_' || value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
 }
 
 func restoreClientWebSearchAliasJSON(data []byte, alias string) ([]byte, error) {

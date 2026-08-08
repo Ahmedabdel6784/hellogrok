@@ -27,7 +27,6 @@ type requestMeta struct {
 	BuildHostedWebSearch int    `json:"build_hosted_web_search"`
 	BuildXSearch         int    `json:"build_x_search"`
 	ProxyAddedWebSearch  bool   `json:"proxy_added_web_search"`
-	ClientSearchForced   bool   `json:"client_web_search_forced"`
 	ClientSearchPrepared bool   `json:"client_web_search_prepared"`
 	ClientSearchAliased  bool   `json:"client_web_search_aliased"`
 }
@@ -65,7 +64,6 @@ func saveLastRequestMeta(target, model string, bodyBytes, tools, webSearch, host
 		BuildHostedWebSearch: request.BuildHostedWebSearch,
 		BuildXSearch:         request.BuildXSearch,
 		ProxyAddedWebSearch:  request.ProxyAddedWebSearch,
-		ClientSearchForced:   request.ClientSearchForced,
 		ClientSearchPrepared: request.ClientSearchPrepared,
 		ClientSearchAliased:  request.ClientSearchAlias != "",
 	})

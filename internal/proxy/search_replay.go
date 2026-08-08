@@ -1,7 +1,11 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,19 +24,25 @@ type searchReplayEntry struct {
 	updated            time.Time
 }
 
+type searchReplayKey struct {
+	callID       string
+	conversation string
+	item         string
+}
+
 // searchReplayCache retains provider-only fields that Grok Build's standard
 // Responses types cannot round-trip. It is memory-only, bounded, and isolated
 // by channel route so identical upstream call IDs cannot cross credentials.
 type searchReplayCache struct {
 	mu       sync.Mutex
-	channels map[string]map[string]searchReplayEntry
+	channels map[string]map[searchReplayKey]searchReplayEntry
 }
 
 func newSearchReplayCache() *searchReplayCache {
-	return &searchReplayCache{channels: map[string]map[string]searchReplayEntry{}}
+	return &searchReplayCache{channels: map[string]map[searchReplayKey]searchReplayEntry{}}
 }
 
-func (c *searchReplayCache) captureJSON(channel string, data []byte) {
+func (c *searchReplayCache) captureJSON(channel, conversation string, data []byte) {
 	if c == nil || channel == "" || len(data) == 0 {
 		return
 	}
@@ -40,15 +50,15 @@ func (c *searchReplayCache) captureJSON(channel string, data []byte) {
 	if json.Unmarshal(data, &value) != nil {
 		return
 	}
-	c.captureValue(channel, value)
+	c.captureValue(channel, conversation, value)
 }
 
-func (c *searchReplayCache) captureValue(channel string, value any) {
+func (c *searchReplayCache) captureValue(channel, conversation string, value any) {
 	if c == nil || channel == "" {
 		return
 	}
 	now := time.Now()
-	entries := map[string][]any{}
+	entries := map[searchReplayKey][]any{}
 	var walk func(any)
 	walk = func(current any) {
 		switch typed := current.(type) {
@@ -59,7 +69,12 @@ func (c *searchReplayCache) captureValue(channel string, value any) {
 				queries, exists := action["queries"].([]any)
 				if id != "" && exists {
 					if clone, ok := boundedJSONSlice(queries, maxSearchReplayQueryBytes); ok {
-						entries[id] = clone
+						key := searchReplayKey{
+							callID:       id,
+							conversation: conversation,
+							item:         searchReplayItemFingerprint(typed),
+						}
+						entries[key] = clone
 					}
 				}
 			}
@@ -81,33 +96,24 @@ func (c *searchReplayCache) captureValue(channel string, value any) {
 	defer c.mu.Unlock()
 	channelEntries := c.channels[channel]
 	if channelEntries == nil {
-		channelEntries = map[string]searchReplayEntry{}
+		channelEntries = map[searchReplayKey]searchReplayEntry{}
 		c.channels[channel] = channelEntries
 	}
 	pruneSearchReplayEntries(channelEntries, now)
-	for id, queries := range entries {
-		entry := channelEntries[id]
+	for key, queries := range entries {
+		entry := channelEntries[key]
 		entry.queries = queries
 		entry.updated = now
-		channelEntries[id] = entry
+		channelEntries[key] = entry
 	}
-	for len(channelEntries) > maxSearchReplaysPerRoute {
-		oldestID := ""
-		var oldest time.Time
-		for id, entry := range channelEntries {
-			if oldestID == "" || entry.updated.Before(oldest) {
-				oldestID, oldest = id, entry.updated
-			}
-		}
-		delete(channelEntries, oldestID)
-	}
+	pruneSearchReplayCount(channelEntries)
 }
 
 // captureMessages retains the exact server-side search blocks returned by a
 // Messages provider. Grok Build's Responses conversation model keeps only a
 // web_search_call, so the pair is restored when that item is sent back to the
 // original Messages endpoint on a later turn.
-func (c *searchReplayCache) captureMessages(channel string, data []byte) {
+func (c *searchReplayCache) captureMessages(channel, conversation string, data []byte) {
 	if c == nil || channel == "" || len(data) == 0 {
 		return
 	}
@@ -128,7 +134,7 @@ func (c *searchReplayCache) captureMessages(channel string, data []byte) {
 			toolResults[stringValue(block["tool_use_id"])] = block
 		}
 	}
-	if len(toolUses) == 0 && len(toolResults) == 0 {
+	if len(toolUses) == 0 || len(toolResults) == 0 {
 		return
 	}
 
@@ -137,40 +143,34 @@ func (c *searchReplayCache) captureMessages(channel string, data []byte) {
 	defer c.mu.Unlock()
 	channelEntries := c.channels[channel]
 	if channelEntries == nil {
-		channelEntries = map[string]searchReplayEntry{}
+		channelEntries = map[searchReplayKey]searchReplayEntry{}
 		c.channels[channel] = channelEntries
 	}
 	pruneSearchReplayEntries(channelEntries, now)
-	for id, block := range toolUses {
-		if id == "" {
+	for id, toolUse := range toolUses {
+		toolResult := toolResults[id]
+		if id == "" || toolResult == nil {
 			continue
 		}
-		clone, ok := boundedJSONObject(block, maxMessagesReplayBytes)
+		useClone, resultClone, ok := boundedMessagesPair(toolUse, toolResult, maxMessagesReplayBytes)
 		if !ok {
 			continue
 		}
-		entry := channelEntries[id]
-		entry.messagesToolUse = clone
-		entry.updated = now
-		channelEntries[id] = entry
-	}
-	for id, block := range toolResults {
-		if id == "" {
-			continue
+		key := searchReplayKey{
+			callID:       id,
+			conversation: conversation,
+			item:         messagesReplayItemFingerprint(toolUse, toolResult),
 		}
-		clone, ok := boundedJSONObject(block, maxMessagesReplayBytes)
-		if !ok {
-			continue
-		}
-		entry := channelEntries[id]
-		entry.messagesToolResult = clone
+		entry := channelEntries[key]
+		entry.messagesToolUse = useClone
+		entry.messagesToolResult = resultClone
 		entry.updated = now
-		channelEntries[id] = entry
+		channelEntries[key] = entry
 	}
 	pruneSearchReplayCount(channelEntries)
 }
 
-func (c *searchReplayCache) messagesBlocks(channel string, item map[string]any) []map[string]any {
+func (c *searchReplayCache) messagesBlocks(channel, conversation string, item map[string]any) []map[string]any {
 	fallback := messagesReplayFallback(item)
 	if c == nil || channel == "" || item == nil {
 		return fallback
@@ -181,25 +181,19 @@ func (c *searchReplayCache) messagesBlocks(channel string, item map[string]any) 
 	defer c.mu.Unlock()
 	channelEntries := c.channels[channel]
 	pruneSearchReplayEntries(channelEntries, now)
-	entry, ok := channelEntries[id]
+	entry, ok := findSearchReplayEntry(channelEntries, searchReplayKey{
+		callID:       id,
+		conversation: conversation,
+		item:         searchReplayItemFingerprint(item),
+	})
 	if !ok {
 		return fallback
 	}
-	blocks := make([]map[string]any, 0, 2)
-	if clone, valid := boundedJSONObject(entry.messagesToolUse, maxMessagesReplayBytes); valid {
-		blocks = append(blocks, clone)
-	} else if len(fallback) > 0 {
-		blocks = append(blocks, fallback[0])
-	}
-	if clone, valid := boundedJSONObject(entry.messagesToolResult, maxMessagesReplayBytes); valid {
-		blocks = append(blocks, clone)
-	} else if len(fallback) > 1 {
-		blocks = append(blocks, fallback[1])
-	}
-	if len(blocks) == 0 {
+	toolUse, toolResult, valid := boundedMessagesPair(entry.messagesToolUse, entry.messagesToolResult, maxMessagesReplayBytes)
+	if !valid {
 		return fallback
 	}
-	return blocks
+	return []map[string]any{toolUse, toolResult}
 }
 
 func messagesReplayFallback(item map[string]any) []map[string]any {
@@ -245,7 +239,8 @@ func (c *searchReplayCache) restore(channel string, root map[string]any) bool {
 	pruneSearchReplayEntries(channelEntries, now)
 
 	changed := false
-	for _, raw := range anySlice(root["input"]) {
+	input := anySlice(root["input"])
+	for index, raw := range input {
 		item, _ := raw.(map[string]any)
 		if stringValue(item["type"]) != "web_search_call" {
 			continue
@@ -254,7 +249,11 @@ func (c *searchReplayCache) restore(channel string, root map[string]any) bool {
 		if action == nil || action["queries"] != nil {
 			continue
 		}
-		entry, ok := channelEntries[stringValue(item["id"])]
+		entry, ok := findSearchReplayEntry(channelEntries, searchReplayKey{
+			callID:       stringValue(item["id"]),
+			conversation: replayConversationFingerprint(input[:index]),
+			item:         searchReplayItemFingerprint(item),
+		})
 		if !ok {
 			continue
 		}
@@ -268,24 +267,126 @@ func (c *searchReplayCache) restore(channel string, root map[string]any) bool {
 	return changed
 }
 
-func pruneSearchReplayEntries(entries map[string]searchReplayEntry, now time.Time) {
-	for id, entry := range entries {
+func findSearchReplayEntry(entries map[searchReplayKey]searchReplayEntry, exact searchReplayKey) (searchReplayEntry, bool) {
+	if entry, ok := entries[exact]; ok {
+		return entry, true
+	}
+	var candidate searchReplayEntry
+	matches := 0
+	for key, entry := range entries {
+		if key.callID != exact.callID || key.item != exact.item {
+			continue
+		}
+		candidate = entry
+		matches++
+		if matches > 1 {
+			return searchReplayEntry{}, false
+		}
+	}
+	return candidate, matches == 1
+}
+
+func replayConversationFingerprint(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func searchReplayItemFingerprint(item map[string]any) string {
+	action, _ := item["action"].(map[string]any)
+	query := firstString(action, "query")
+	if query == "" {
+		query = firstSearchQuery(action["queries"])
+	}
+	sources := normalizedReplaySources(action["sources"])
+	data, _ := json.Marshal(map[string]any{
+		"query":   normalizeReplayText(query),
+		"sources": sources,
+	})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func messagesReplayItemFingerprint(toolUse, toolResult map[string]any) string {
+	input, _ := toolUse["input"].(map[string]any)
+	item := map[string]any{
+		"action": map[string]any{
+			"query":   firstString(input, "query", "q"),
+			"sources": messagesReplaySources(toolResult["content"]),
+		},
+	}
+	return searchReplayItemFingerprint(item)
+}
+
+func messagesReplaySources(value any) []any {
+	var sources []any
+	for _, raw := range anySlice(value) {
+		entry, _ := raw.(map[string]any)
+		if stringValue(entry["type"]) != "web_search_result" || stringValue(entry["url"]) == "" {
+			continue
+		}
+		source := map[string]any{"url": stringValue(entry["url"])}
+		if title := stringValue(entry["title"]); title != "" {
+			source["title"] = title
+		}
+		sources = append(sources, source)
+	}
+	return sources
+}
+
+func normalizedReplaySources(value any) []map[string]string {
+	sources := make([]map[string]string, 0)
+	for _, raw := range anySlice(value) {
+		source, _ := raw.(map[string]any)
+		url := strings.TrimSpace(stringValue(source["url"]))
+		title := normalizeReplayText(stringValue(source["title"]))
+		if url == "" && title == "" {
+			continue
+		}
+		identity := map[string]string{}
+		if url != "" {
+			identity["url"] = url
+		} else {
+			identity["title"] = title
+		}
+		sources = append(sources, identity)
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		if sources[i]["url"] == sources[j]["url"] {
+			return sources[i]["title"] < sources[j]["title"]
+		}
+		return sources[i]["url"] < sources[j]["url"]
+	})
+	return sources
+}
+
+func normalizeReplayText(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func pruneSearchReplayEntries(entries map[searchReplayKey]searchReplayEntry, now time.Time) {
+	for key, entry := range entries {
 		if now.Sub(entry.updated) > searchReplayTTL {
-			delete(entries, id)
+			delete(entries, key)
 		}
 	}
 }
 
-func pruneSearchReplayCount(entries map[string]searchReplayEntry) {
+func pruneSearchReplayCount(entries map[searchReplayKey]searchReplayEntry) {
 	for len(entries) > maxSearchReplaysPerRoute {
-		oldestID := ""
+		var oldestKey searchReplayKey
 		var oldest time.Time
-		for id, entry := range entries {
-			if oldestID == "" || entry.updated.Before(oldest) {
-				oldestID, oldest = id, entry.updated
+		first := true
+		for key, entry := range entries {
+			if first || entry.updated.Before(oldest) {
+				oldestKey, oldest = key, entry.updated
+				first = false
 			}
 		}
-		delete(entries, oldestID)
+		delete(entries, oldestKey)
 	}
 }
 
@@ -301,17 +402,17 @@ func boundedJSONSlice(values []any, maxBytes int) ([]any, bool) {
 	return clone, true
 }
 
-func boundedJSONObject(value map[string]any, maxBytes int) (map[string]any, bool) {
-	if value == nil {
-		return nil, false
+func boundedMessagesPair(toolUse, toolResult map[string]any, maxBytes int) (map[string]any, map[string]any, bool) {
+	if toolUse == nil || toolResult == nil {
+		return nil, nil, false
 	}
-	data, err := json.Marshal(value)
+	data, err := json.Marshal([]any{toolUse, toolResult})
 	if err != nil || len(data) > maxBytes {
-		return nil, false
+		return nil, nil, false
 	}
-	var clone map[string]any
-	if json.Unmarshal(data, &clone) != nil {
-		return nil, false
+	var clone []map[string]any
+	if json.Unmarshal(data, &clone) != nil || len(clone) != 2 || clone[0] == nil || clone[1] == nil {
+		return nil, nil, false
 	}
-	return clone, true
+	return clone[0], clone[1], true
 }

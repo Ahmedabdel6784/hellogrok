@@ -11,6 +11,9 @@ func TestProxyEnabledDefaultsTrueAndPersistsExplicitChoice(t *testing.T) {
 	if enabled, err := ProxyEnabled(path); err != nil || !enabled {
 		t.Fatalf("default enabled=%v err=%v", enabled, err)
 	}
+	if days, err := LogRetentionUsageDays(path); err != nil || days != DefaultLogRetentionUsageDays {
+		t.Fatalf("default retention=%v err=%v", days, err)
+	}
 	if err := SetProxyEnabled(path, false); err != nil {
 		t.Fatal(err)
 	}
@@ -23,6 +26,15 @@ func TestProxyEnabledDefaultsTrueAndPersistsExplicitChoice(t *testing.T) {
 	if enabled, err := ProxyEnabled(path); err != nil || !enabled {
 		t.Fatalf("saved true enabled=%v err=%v", enabled, err)
 	}
+	if err := SetLogRetentionUsageDays(path, 14); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, err := ProxyEnabled(path); err != nil || !enabled {
+		t.Fatalf("retention update lost proxy state: enabled=%v err=%v", enabled, err)
+	}
+	if days, err := LogRetentionUsageDays(path); err != nil || days != 14 {
+		t.Fatalf("saved retention=%v err=%v", days, err)
+	}
 }
 
 func TestProxyEnabledRejectsCorruptSettings(t *testing.T) {
@@ -33,5 +45,24 @@ func TestProxyEnabledRejectsCorruptSettings(t *testing.T) {
 	}
 	if _, err := ProxyEnabled(path); err == nil {
 		t.Fatal("corrupt settings must not be ignored")
+	}
+}
+
+func TestSettingsUpgradeKeepsLegacyProxyChoiceAndAddsRetentionDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), settingsFileName)
+	if err := os.WriteFile(path, []byte("{\"proxy_enabled\":false}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, err := ProxyEnabled(path); err != nil || enabled {
+		t.Fatalf("legacy proxy enabled=%v err=%v", enabled, err)
+	}
+	if days, err := LogRetentionUsageDays(path); err != nil || days != DefaultLogRetentionUsageDays {
+		t.Fatalf("legacy retention=%v err=%v", days, err)
+	}
+	if err := SetLogRetentionUsageDays(path, 3); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, err := ProxyEnabled(path); err != nil || enabled {
+		t.Fatalf("legacy false was not preserved: enabled=%v err=%v", enabled, err)
 	}
 }

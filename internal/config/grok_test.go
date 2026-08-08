@@ -7,6 +7,89 @@ import (
 	"testing"
 )
 
+func TestLoadModelsSupportsQuotedAndLegacyDottedChannelIDs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	raw := `[model."provider.with-dot"]
+name = "Provider.v1-beta"
+model = "wire.one"
+base_url = "https://quoted.example/v1"
+api_key = "quoted-key"
+
+[model.legacy.with-dot]
+name = "Legacy.v2-beta"
+model = "wire.two"
+base_url = "https://legacy.example/v1"
+api_key = "legacy-key"
+
+[model.provider-with-dash]
+name = "Provider-with-dash.v3"
+model = "wire-three"
+base_url = "https://dash.example/v1"
+api_key = "dash-key"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]Model, len(models))
+	for _, model := range models {
+		byID[model.ID] = model
+	}
+	for id, wantName := range map[string]string{
+		"provider.with-dot":  "Provider.v1-beta",
+		"legacy.with-dot":    "Legacy.v2-beta",
+		"provider-with-dash": "Provider-with-dash.v3",
+	} {
+		if got := byID[id]; got.ID != id || got.Name != wantName {
+			t.Fatalf("model %q = %+v, want name %q", id, got, wantName)
+		}
+	}
+	routes, err := BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 3 {
+		t.Fatalf("routes=%d, want 3", len(routes))
+	}
+	for _, route := range routes {
+		if route.APIKey == "" || route.ChannelID == "" {
+			t.Fatalf("special-character route lost identity or auth: %+v", route)
+		}
+	}
+}
+
+func TestLoadModelsNormalizesSingularMessageBackend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	raw := `[model.claude-llmx]
+model = "claude-opus-5"
+base_url = "https://messages.example.test/v1"
+api_key = "test-key"
+api_backend = "message"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models, err := LoadModels(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].APIBackend != "messages" {
+		t.Fatalf("models = %+v, want singular message normalized to messages", models)
+	}
+	routes, err := BuildRoutes(models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].APIBackend != "messages" || routes[0].WireModel != "claude-opus-5" || routes[0].AuthScheme != "bearer" {
+		t.Fatalf("routes = %+v", routes)
+	}
+}
+
 func TestBuildRoutesRecordsWireModels(t *testing.T) {
 	routes, err := BuildRoutes([]Model{
 		{ID: "gpt-channel", Model: "gpt-5.6-sol", BaseURL: "https://example.test/v1", APIBackend: "responses"},
@@ -284,9 +367,6 @@ base_url = "https://plain.example/v1"
 	if !byModel["inherited"].SupportsBackendSearch {
 		t.Fatal("provider backend-search capability was not inherited")
 	}
-	if !byModel["inherited"].BackendSearchSet || !byModel["disabled"].BackendSearchSet || byModel["default-disabled"].BackendSearchSet {
-		t.Fatalf("explicit and missing backend-search declarations were collapsed: %#v", byModel)
-	}
 	if byModel["disabled"].SupportsBackendSearch || byModel["default-disabled"].SupportsBackendSearch {
 		t.Fatalf("false or missing capability became enabled: %#v", byModel)
 	}
@@ -301,9 +381,6 @@ base_url = "https://plain.example/v1"
 	}
 	if !byRoute["inherited"].SupportsBackendSearch || byRoute["disabled"].SupportsBackendSearch || byRoute["default-disabled"].SupportsBackendSearch {
 		t.Fatalf("route capabilities do not match config: %#v", byRoute)
-	}
-	if !byRoute["inherited"].BackendSearchSet || !byRoute["disabled"].BackendSearchSet || byRoute["default-disabled"].BackendSearchSet {
-		t.Fatalf("route declaration presence was not preserved: %#v", byRoute)
 	}
 }
 

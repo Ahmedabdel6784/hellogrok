@@ -20,7 +20,7 @@ import (
 const (
 	ProxyHost    = "127.0.0.1"
 	ProxyPort    = "18787"
-	stateVersion = 5
+	stateVersion = 6
 
 	ccSwitchProxyToken = "PROXY_MANAGED"
 )
@@ -93,10 +93,17 @@ type SubagentState struct {
 }
 
 type ModelState struct {
-	BaseURL       ManagedLineState `json:"base_url"`
-	APIBaseURL    ManagedLineState `json:"api_base_url,omitempty"`
-	APIBackend    ManagedLineState `json:"api_backend"`
-	BackendSearch ManagedLineState `json:"backend_search"`
+	Section       ModelSectionState `json:"section,omitempty"`
+	BaseURL       ManagedLineState  `json:"base_url"`
+	APIBaseURL    ManagedLineState  `json:"api_base_url,omitempty"`
+	APIBackend    ManagedLineState  `json:"api_backend"`
+	BackendSearch ManagedLineState  `json:"backend_search"`
+}
+
+type ModelSectionState struct {
+	Managed      bool   `json:"managed"`
+	OriginalLine string `json:"original_line,omitempty"`
+	AppliedLine  string `json:"applied_line,omitempty"`
 }
 
 type ManagedLineState struct {
@@ -108,15 +115,67 @@ type ManagedLineState struct {
 }
 
 type ApplyResult struct {
-	BaseURLs         int
-	APIBaseURLs      int
-	APIBackends      int
-	BackendSearch    int
-	BackendTools     int
-	WebFetch         int
-	SubagentsEnabled int
-	ValidatedTargets int
-	Targets          []string
+	ModelSections      int
+	BaseURLs           int
+	APIBaseURLs        int
+	APIBackends        int
+	BackendSearch      int
+	BackendTools       int
+	WebFetch           int
+	SubagentsEnabled   int
+	ValidatedTargets   int
+	Targets            []string
+	LegacyModelAliases map[string]string
+}
+
+// ModelTables returns [model.<id>] entries keyed by their effective ID. TOML
+// treats an unquoted dotted key such as [model.foo.bar] as nested tables. Grok
+// Build expects dotted model IDs to be quoted, but flattening those leaf tables
+// here lets hellogrok repair the header before Grok reloads the config.
+func ModelTables(root map[string]any) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	models, _ := root["model"].(map[string]any)
+	for id, value := range models {
+		collectModelTables(out, id, value)
+	}
+	return out
+}
+
+func collectModelTables(out map[string]map[string]any, id string, value any) {
+	table, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	if isModelEntryTable(table) {
+		out[id] = table
+		return
+	}
+	foundChild := false
+	for childID, child := range table {
+		if _, ok := child.(map[string]any); !ok {
+			continue
+		}
+		foundChild = true
+		collectModelTables(out, id+"."+childID, child)
+	}
+	if !foundChild {
+		out[id] = table
+	}
+}
+
+func isModelEntryTable(table map[string]any) bool {
+	for key, value := range table {
+		switch key {
+		case "model", "name", "model_provider", "base_url", "api_base_url",
+			"api_backend", "api_key", "env_key", "auth_provider", "auth_scheme",
+			"supports_backend_search", "extra_headers", "env_http_headers":
+			return true
+		}
+		if _, nested := value.(map[string]any); !nested {
+			return true
+		}
+	}
+	return false
 }
 
 func StatePath(dataDir string) string {
@@ -156,7 +215,7 @@ func DetectCCSwitchTakeover(configPath string) (CCSwitchTakeover, error) {
 	if err := toml.Unmarshal(raw, &root); err != nil {
 		return CCSwitchTakeover{}, fmt.Errorf("parse TOML: %w", err)
 	}
-	models, _ := root["model"].(map[string]any)
+	models := ModelTables(root)
 	if len(models) == 0 {
 		return CCSwitchTakeover{}, nil
 	}
@@ -177,7 +236,7 @@ func DetectCCSwitchTakeover(configPath string) (CCSwitchTakeover, error) {
 	ids = append(ids, remaining...)
 
 	for _, id := range ids {
-		model, _ := models[id].(map[string]any)
+		model := models[id]
 		apiKey, _ := model["api_key"].(string)
 		baseURL, _ := model["base_url"].(string)
 		if strings.TrimSpace(apiKey) == ccSwitchProxyToken && isCCSwitchGrokProxyURL(baseURL) {
@@ -208,10 +267,9 @@ func ActiveProxyReferences(configPath string) ([]string, error) {
 	if err := toml.Unmarshal(raw, &root); err != nil {
 		return nil, fmt.Errorf("parse TOML: %w", err)
 	}
-	models, _ := root["model"].(map[string]any)
+	models := ModelTables(root)
 	refs := make([]string, 0)
-	for id, value := range models {
-		model, _ := value.(map[string]any)
+	for id, model := range models {
 		for _, field := range []string{"base_url", "api_base_url"} {
 			if endpoint, _ := model[field].(string); IsProxyURL(endpoint) {
 				refs = append(refs, id+"."+field)
@@ -341,6 +399,12 @@ func ApplyTargets(configPath, statePath string, targets []Target) (ApplyResult, 
 		}
 		result.Targets = append(result.Targets, id)
 	}
+	for legacyID, targetID := range result.LegacyModelAliases {
+		_, collidesWithTarget := targetMap[legacyID]
+		if targetID == "" || collidesWithTarget {
+			delete(result.LegacyModelAliases, legacyID)
+		}
+	}
 	sort.Strings(result.Targets)
 	if err := validateManagedConfig([]byte(text), targetMap, state); err != nil {
 		return ApplyResult{}, fmt.Errorf("validate prepared config: %w", err)
@@ -399,8 +463,8 @@ func validateManagedConfig(raw []byte, targets map[string]Target, state State) e
 		}
 	}
 
-	models, ok := root["model"].(map[string]any)
-	if !ok {
+	models := ModelTables(root)
+	if len(models) == 0 {
 		return fmt.Errorf("missing [model.*] tables")
 	}
 	ids := make([]string, 0, len(targets))
@@ -408,10 +472,14 @@ func validateManagedConfig(raw []byte, targets map[string]Target, state State) e
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	sectionLines := modelSectionLines(raw)
 	for _, id := range ids {
-		model, ok := models[id].(map[string]any)
+		model, ok := models[id]
 		if !ok {
 			return fmt.Errorf("missing [model.%s] table", id)
+		}
+		if section := state.Models[id].Section; section.Managed && sectionLines[id] != section.AppliedLine {
+			return fmt.Errorf("[model.%s] header changed while preparing config", id)
 		}
 		proxyURL, err := ToChannelProxyURL(id)
 		if err != nil {
@@ -436,10 +504,10 @@ func validateManagedConfig(raw []byte, targets map[string]Target, state State) e
 }
 
 func validateTargetBackendSearchValues(root map[string]any, targets map[string]Target) error {
-	models, _ := root["model"].(map[string]any)
+	models := ModelTables(root)
 	providers, _ := root["model_providers"].(map[string]any)
 	for id := range targets {
-		model, _ := models[id].(map[string]any)
+		model := models[id]
 		if model == nil {
 			continue
 		}
@@ -489,7 +557,7 @@ func discardUncommittedState(statePath string, cause error) error {
 }
 
 func supportedStateVersion(version int) bool {
-	return version == stateVersion
+	return version == 5 || version == stateVersion
 }
 
 // rewriteSubagentEnabled repairs a Grok Build 0.2.118 defaulting bug. When a
@@ -661,7 +729,7 @@ func rewriteConfig(text string, targets map[string]Target, state *State) (string
 	lines := splitKeepNL(text)
 	structural := tomlStructuralLines(lines)
 	ending := preferredLineEnding(text)
-	result := ApplyResult{}
+	result := ApplyResult{LegacyModelAliases: map[string]string{}}
 	found := map[string]bool{}
 	out := make([]string, 0, len(lines)+len(targets)*3)
 
@@ -722,6 +790,26 @@ func rewriteModelBlock(block []string, id string, target Target, state *State, e
 		return nil, err
 	}
 	modelState := state.Models[id]
+	if len(block) == 0 {
+		return nil, fmt.Errorf("model section %q is empty", id)
+	}
+	if applied, changed := canonicalModelSectionLine(block[0], id); changed {
+		if !modelState.Section.Managed {
+			modelState.Section = ModelSectionState{
+				Managed:      true,
+				OriginalLine: block[0],
+				AppliedLine:  applied,
+			}
+			result.ModelSections++
+		}
+		legacyID := strings.SplitN(id, ".", 2)[0]
+		if existing, found := result.LegacyModelAliases[legacyID]; !found {
+			result.LegacyModelAliases[legacyID] = id
+		} else if existing != id {
+			result.LegacyModelAliases[legacyID] = ""
+		}
+		block[0] = applied
+	}
 	fields := []managedField{
 		{name: "base_url", pattern: baseURLLine, anyPattern: baseURLAnyLine, value: quoteTOML(proxyURL), state: &modelState.BaseURL, changed: &result.BaseURLs},
 	}
@@ -880,6 +968,10 @@ func Restore(configPath, statePath string) (int, error) {
 		block := append([]string(nil), lines[i:end]...)
 		if modelState, ok := state.Models[id]; ok {
 			block, restored = restoreModelBlock(block, modelState, restored, end == len(lines))
+			if modelState.Section.Managed {
+				block[0] = modelState.Section.OriginalLine
+				restored++
+			}
 		}
 		out = append(out, block...)
 		i = end
@@ -923,9 +1015,13 @@ func matchesOriginalManagedState(raw []byte, state State) (bool, error) {
 		return false, err
 	}
 
-	models, _ := root["model"].(map[string]any)
+	models := ModelTables(root)
+	sectionLines := modelSectionLines(raw)
 	for id, modelState := range state.Models {
-		model, _ := models[id].(map[string]any)
+		if modelState.Section.Managed && sectionLines[id] != modelState.Section.OriginalLine {
+			return false, nil
+		}
+		model := models[id]
 		for _, check := range []managedValueCheck{
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
@@ -1016,15 +1112,19 @@ func validateRestorableConfig(raw []byte, state State) error {
 	}); err != nil {
 		return err
 	}
-	models, _ := root["model"].(map[string]any)
+	models := ModelTables(root)
+	sectionLines := modelSectionLines(raw)
 	ids := make([]string, 0, len(state.Models))
 	for id := range state.Models {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		model, _ := models[id].(map[string]any)
+		model := models[id]
 		modelState := state.Models[id]
+		if modelState.Section.Managed && sectionLines[id] != modelState.Section.AppliedLine {
+			return fmt.Errorf("[model.%s] header changed while proxy was active", id)
+		}
 		if err := validateManagedTable(fmt.Sprintf("[model.%s]", id), model, []managedValueCheck{
 			{key: "base_url", state: modelState.BaseURL},
 			{key: "api_base_url", state: modelState.APIBaseURL},
@@ -1427,6 +1527,44 @@ func modelSectionID(line string) string {
 		return ""
 	}
 	return firstNonEmpty(model[1], model[2], model[3])
+}
+
+func canonicalModelSectionLine(line, id string) (string, bool) {
+	if !strings.Contains(id, ".") {
+		return line, false
+	}
+	section := sectionRe.FindStringSubmatch(strings.TrimSpace(line))
+	if section == nil {
+		return line, false
+	}
+	name := strings.TrimSpace(section[1])
+	key := strings.TrimSpace(strings.TrimPrefix(name, "model."))
+	if strings.HasPrefix(key, `"`) || strings.HasPrefix(key, `'`) {
+		return line, false
+	}
+	bare := strings.TrimRight(line, "\r\n")
+	open := strings.IndexByte(bare, '[')
+	close := strings.IndexByte(bare, ']')
+	if open < 0 || close <= open {
+		return line, false
+	}
+	applied := bare[:open] + "[model." + quoteTOML(id) + "]" + bare[close+1:] + lineEnding(line)
+	return applied, applied != line
+}
+
+func modelSectionLines(raw []byte) map[string]string {
+	lines := splitKeepNL(string(raw))
+	structural := tomlStructuralLines(lines)
+	out := make(map[string]string)
+	for index, line := range lines {
+		if !structural[index] {
+			continue
+		}
+		if id := modelSectionID(line); id != "" {
+			out[id] = line
+		}
+	}
+	return out
 }
 
 func quoteTOML(value string) string {

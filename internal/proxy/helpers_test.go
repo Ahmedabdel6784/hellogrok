@@ -28,7 +28,7 @@ func TestRequestMetadataDoesNotPersistRequestContent(t *testing.T) {
 		t.Fatalf("summary tools=%d web=%d hosted=%d function=%d x=%d", tools, webSearch, hostedWebSearch, functionWebSearch, xSearch)
 	}
 
-	request := facadeRequest{BuildXSearch: 1, ProxyAddedWebSearch: true, ClientSearchForced: true, ClientSearchPrepared: true, ClientSearchAlias: clientWebSearchWireAliasBase}
+	request := facadeRequest{BuildXSearch: 1, ProxyAddedWebSearch: true, ClientSearchPrepared: true, ClientSearchAlias: clientWebSearchWireAliasBase}
 	saveLastRequestMeta("https://example.test/v1/responses", "gpt-test", len(body), tools, webSearch, hostedWebSearch, functionWebSearch, xSearch, request)
 	if _, err := os.Stat(filepath.Join(dir, "last_request.json")); !os.IsNotExist(err) {
 		t.Fatalf("full request snapshot must not exist: %v", err)
@@ -46,7 +46,7 @@ func TestRequestMetadataDoesNotPersistRequestContent(t *testing.T) {
 	}
 	if meta.Model != "gpt-test" || meta.Tools != 2 || meta.WebSearch != 1 ||
 		meta.HostedWebSearch != 0 || meta.FunctionWebSearch != 1 || meta.XSearch != 1 ||
-		meta.BuildXSearch != 1 || !meta.ProxyAddedWebSearch || !meta.ClientSearchForced || !meta.ClientSearchPrepared || !meta.ClientSearchAliased {
+		meta.BuildXSearch != 1 || !meta.ProxyAddedWebSearch || !meta.ClientSearchPrepared || !meta.ClientSearchAliased {
 		t.Fatalf("unexpected metadata: %+v", meta)
 	}
 }

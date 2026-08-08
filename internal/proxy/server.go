@@ -310,6 +310,14 @@ func (c *trackedConn) Close() error {
 }
 
 func writeJSONError(w http.ResponseWriter, code int, message string) {
+	writeJSONErrorWithRetry(w, code, message, false)
+}
+
+func writeRetryableJSONError(w http.ResponseWriter, code int, message string) {
+	writeJSONErrorWithRetry(w, code, message, true)
+}
+
+func writeJSONErrorWithRetry(w http.ResponseWriter, code int, message string, shouldRetry bool) {
 	body, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
 			"message": message,
@@ -318,6 +326,7 @@ func writeJSONError(w http.ResponseWriter, code int, message string) {
 		},
 	})
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Should-Retry", fmt.Sprintf("%t", shouldRetry))
 	w.WriteHeader(code)
 	_, _ = w.Write(body)
 }
@@ -366,37 +375,20 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	probed := false
 	evidence := newSearchEvidence()
 	clientWriteFailed := false
-	writeFrame := func(lines []string) error {
-		if len(lines) == 0 {
-			return nil
-		}
-		payload, hasData := sseFramePayload(lines)
-		trimmedPayload := strings.TrimSpace(payload)
-		patchedData := ""
-		if hasData {
-			patchedData = "data: " + payload
-		}
-		if hasData && trimmedPayload != "" && trimmedPayload != "[DONE]" {
-			restored, err := restoreClientWebSearchAliasJSON([]byte(payload), request.ClientSearchAlias)
-			if err != nil {
-				return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
-			}
-			payload = string(restored)
-			s.replays.captureJSON(channel, restored)
-			evidence.observeJSON(restored)
-			terminal = responseEventTerminal(payload, terminal)
-			if terminal != "" && !probed {
-				s.probeOnce(channel, []byte("data: "+payload), true)
-				probed = true
-			}
-			patchedData = patch.PatchSSEDataLineWithSequence("data: "+payload, options, events)
-			events++
-		}
+	type deferredFrame struct {
+		lines []string
+		event map[string]any
+	}
+	var deferredSearchDone []deferredFrame
+	var streamedText strings.Builder
+	var streamedURLs []string
+
+	writePayloadFrame := func(lines []string, payload string) error {
 		insertedData := false
 		for _, line := range lines {
 			if strings.HasPrefix(line, "data:") {
 				if !insertedData {
-					if _, err := io.WriteString(w, patchedData+"\n"); err != nil {
+					if _, err := io.WriteString(w, "data: "+payload+"\n"); err != nil {
 						clientWriteFailed = true
 						return err
 					}
@@ -415,6 +407,98 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		}
 		flusher.Flush()
 		return nil
+	}
+	writeJSONFrame := func(lines []string, event map[string]any) error {
+		event["sequence_number"] = events
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return fmt.Errorf("encode upstream Responses SSE data: %w", err)
+		}
+		if err := validateResponsesEventPayload(payload); err != nil {
+			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
+		}
+		s.replays.captureJSON(channel, request.ReplayScope, payload)
+		events++
+		return writePayloadFrame(lines, string(payload))
+	}
+	findOutputItem := func(response map[string]any, id string) map[string]any {
+		for _, raw := range anySlice(response["output"]) {
+			item, _ := raw.(map[string]any)
+			if item != nil && stringValue(item["id"]) == id {
+				return item
+			}
+		}
+		return nil
+	}
+	writeFrame := func(lines []string) error {
+		if len(lines) == 0 {
+			return nil
+		}
+		payload, hasData := sseFramePayload(lines)
+		trimmedPayload := strings.TrimSpace(payload)
+		if !hasData {
+			return writePayloadFrame(lines, "")
+		}
+		if trimmedPayload == "" || trimmedPayload == "[DONE]" {
+			return writePayloadFrame(lines, payload)
+		}
+
+		restored, err := restoreClientWebSearchAliasJSON([]byte(payload), request.ClientSearchAlias)
+		if err != nil {
+			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
+		}
+		evidence.observeJSON(restored)
+		patchedData := patch.PatchSSEDataLineWithSequence("data: "+string(restored), options, events)
+		patchedPayload := strings.TrimSpace(strings.TrimPrefix(patchedData, "data:"))
+		event, err := decodeJSONMap([]byte(patchedPayload))
+		if err != nil {
+			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
+		}
+		streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromJSON(event)...)
+		switch stringValue(event["type"]) {
+		case "response.output_text.delta":
+			streamedText.WriteString(stringValue(event["delta"]))
+		case "response.output_text.done":
+			streamedText.WriteString(stringValue(event["text"]))
+		}
+
+		if stringValue(event["type"]) == "response.output_item.done" && request.HostedWebSearch {
+			item, _ := event["item"].(map[string]any)
+			action, _ := item["action"].(map[string]any)
+			if item != nil && stringValue(item["type"]) == "web_search_call" && len(anySlice(action["sources"])) == 0 {
+				deferredSearchDone = append(deferredSearchDone, deferredFrame{lines: append([]string(nil), lines...), event: event})
+				return nil
+			}
+		}
+
+		eventType := stringValue(event["type"])
+		if eventType == "response.completed" || eventType == "response.incomplete" || eventType == "response.failed" {
+			responseBody, _ := event["response"].(map[string]any)
+			if responseBody != nil {
+				backfillResponseSearchSources(responseBody, request.HostedWebSearch, request.SearchQuery)
+				streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromText(streamedText.String())...)
+				mergeResponseSearchURLs(responseBody, streamedURLs)
+			}
+			for index, deferred := range deferredSearchDone {
+				item, _ := deferred.event["item"].(map[string]any)
+				if replacement := findOutputItem(responseBody, stringValue(item["id"])); replacement != nil {
+					deferred.event["item"] = cloneMap(replacement)
+				} else if index == len(deferredSearchDone)-1 {
+					mergeWebSearchSources(item, urlsToSources(streamedURLs))
+				}
+				if err := writeJSONFrame(deferred.lines, deferred.event); err != nil {
+					return err
+				}
+			}
+			deferredSearchDone = nil
+			terminal = eventType
+			if !probed {
+				encoded, _ := json.Marshal(event)
+				s.probeOnce(channel, append([]byte("data: "), encoded...), true)
+				probed = true
+			}
+		}
+		return writeJSONFrame(lines, event)
 	}
 
 	frame := make([]string, 0, 4)
@@ -488,23 +572,6 @@ func sseFramePayload(lines []string) (string, bool) {
 		return "", false
 	}
 	return strings.Join(parts, "\n"), true
-}
-
-func responseEventTerminal(payload, current string) string {
-	var event map[string]any
-	if json.Unmarshal([]byte(payload), &event) != nil {
-		return current
-	}
-	switch event["type"] {
-	case "response.completed":
-		return "response.completed"
-	case "response.incomplete":
-		return "response.incomplete"
-	case "response.failed":
-		return "response.failed"
-	default:
-		return current
-	}
 }
 
 func extractModel(body []byte) string {

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -67,9 +68,9 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 
 	tools, webSearch, hostedSearch, functionSearch, xSearch := summarizeBody(request.Body)
 	logTarget := safeDiagnosticTarget(target)
-	s.log.Printf("UP channel=%s backend=%s %s body=%dB model=%s tools=%d web_search=%d hosted_web_search=%d function_web_search=%d x_search=%d build_hosted_web_search=%d build_x_search=%d proxy_added_web_search=%t client_web_search_forced=%t client_web_search_prepared=%t client_web_search_aliased=%t",
+	s.log.Printf("UP channel=%s backend=%s %s body=%dB model=%s tools=%d web_search=%d hosted_web_search=%d function_web_search=%d x_search=%d build_hosted_web_search=%d build_x_search=%d proxy_added_web_search=%t client_web_search_prepared=%t client_web_search_aliased=%t",
 		route.ChannelID, route.APIBackend, logTarget, len(request.Body), route.WireModel, tools, webSearch, hostedSearch, functionSearch, xSearch,
-		request.BuildHostedWebSearch, request.BuildXSearch, request.ProxyAddedWebSearch, request.ClientSearchForced, request.ClientSearchPrepared, request.ClientSearchAlias != "")
+		request.BuildHostedWebSearch, request.BuildXSearch, request.ProxyAddedWebSearch, request.ClientSearchPrepared, request.ClientSearchAlias != "")
 	saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
 	if incomingModel := extractModel(body); incomingModel != "" && incomingModel != route.WireModel {
 		s.log.Printf("UP model isolated channel=%s: %s -> %s", route.ChannelID, incomingModel, route.WireModel)
@@ -98,8 +99,8 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		req.Host = u.Host
 		copySafeRequestHeaders(req.Header, incoming.Header)
 		req.Header.Set("Content-Type", "application/json")
-		if request.Protocol == wireResponses {
-			req.Header.Set("Accept", "application/json, text/event-stream")
+		if request.Stream {
+			req.Header.Set("Accept", "text/event-stream, application/json")
 		} else {
 			req.Header.Set("Accept", "application/json")
 		}
@@ -120,7 +121,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	if err != nil {
 		detail := safeUpstreamError(err)
 		s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
-		writeJSONError(w, http.StatusBadGateway, "upstream: "+detail)
+		writeRetryableJSONError(w, http.StatusBadGateway, "upstream: "+detail)
 		return
 	}
 	defer resp.Body.Close()
@@ -140,7 +141,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			if errors.Is(readErr, errBodyTooLarge) {
 				writeJSONError(w, http.StatusBadGateway, "upstream error body exceeds 64 MiB")
 			} else {
-				writeJSONError(w, http.StatusBadGateway, "read upstream error response: "+readErr.Error())
+				writeRetryableJSONError(w, http.StatusBadGateway, "read upstream error response: "+readErr.Error())
 			}
 			return
 		}
@@ -151,18 +152,37 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	}
 
 	options := patch.Options{GPTResponses: true, WebSearch: true, RequestModel: route.WireModel}
-	if request.Protocol == wireResponses {
-		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-			if !request.Stream {
-				writeJSONError(w, http.StatusBadGateway, "upstream ignored stream=false; cannot return an event stream")
-				return
-			}
+	upstreamSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	if upstreamSSE && !request.Stream {
+		writeJSONError(w, http.StatusBadGateway, "upstream ignored stream=false; cannot return an event stream")
+		return
+	}
+	if upstreamSSE {
+		switch request.Protocol {
+		case wireResponses:
 			s.streamResponsesSSE(w, resp, route.ChannelID, request, options, started)
-			return
+		case wireMessages:
+			s.streamMessagesSSE(w, resp, route, request, started)
+		case wireChatCompletions:
+			s.streamChatSSE(w, resp, route, request, started)
+		default:
+			writeJSONError(w, http.StatusInternalServerError, "unsupported streaming backend")
 		}
+		return
+	}
+
+	if request.Protocol == wireResponses {
 		data, readErr := readBodyLimited(resp.Body, maxFacadeBodyBytes)
 		if readErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "read upstream response: "+readErr.Error())
+			if errors.Is(readErr, errBodyTooLarge) {
+				writeJSONError(w, http.StatusBadGateway, "upstream response body exceeds 64 MiB")
+			} else {
+				writeRetryableJSONError(w, http.StatusBadGateway, "read upstream response: "+readErr.Error())
+			}
+			return
+		}
+		if isHTMLContentType(resp.Header.Get("Content-Type")) {
+			writeJSONError(w, http.StatusBadGateway, upstreamHTMLResponseMessage(route.APIBackend))
 			return
 		}
 		data, readErr = restoreClientWebSearchAliasJSON(data, request.ClientSearchAlias)
@@ -170,21 +190,32 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body while restoring client search: "+readErr.Error())
 			return
 		}
-		evidence := newSearchEvidence()
-		evidence.observeJSON(data)
-		s.logSearchEvidence(route.ChannelID, request, evidence)
-		s.replays.captureJSON(route.ChannelID, data)
 		data, readErr = patch.PatchJSONBytesStrict(data, options)
 		if readErr != nil {
 			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+readErr.Error())
 			return
 		}
+		canonical, decodeErr := decodeJSONMap(data)
+		if decodeErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+decodeErr.Error())
+			return
+		}
+		backfillResponseSearchSources(canonical, request.HostedWebSearch, request.SearchQuery)
+		if validateErr := validateResponsesEnvelope(canonical); validateErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+validateErr.Error())
+			return
+		}
+		data, readErr = json.Marshal(canonical)
+		if readErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "encode upstream Responses body: "+readErr.Error())
+			return
+		}
+		evidence := newSearchEvidence()
+		evidence.observeJSON(data)
+		s.logSearchEvidence(route.ChannelID, request, evidence)
+		s.replays.captureJSON(route.ChannelID, request.ReplayScope, data)
 		if request.Stream {
-			canonical, decodeErr := decodeJSONMap(data)
-			if decodeErr != nil {
-				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Responses body: "+decodeErr.Error())
-				return
-			}
+			s.log.Printf("UP channel=%s backend=responses ignored stream=true; emitting buffered JSON fallback", route.ChannelID)
 			if writeErr := writeCanonicalResponse(w, canonical, true); writeErr != nil {
 				writeJSONError(w, http.StatusBadGateway, "invalid non-stream Responses body: "+writeErr.Error())
 			}
@@ -199,11 +230,15 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 
 	data, readErr := readBodyLimited(resp.Body, maxFacadeBodyBytes)
 	if readErr != nil {
-		writeJSONError(w, http.StatusBadGateway, "read upstream response: "+readErr.Error())
+		if errors.Is(readErr, errBodyTooLarge) {
+			writeJSONError(w, http.StatusBadGateway, "upstream response body exceeds 64 MiB")
+		} else {
+			writeRetryableJSONError(w, http.StatusBadGateway, "read upstream response: "+readErr.Error())
+		}
 		return
 	}
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-		writeJSONError(w, http.StatusBadGateway, "upstream ignored stream=false; cannot canonicalize response")
+	if isHTMLContentType(resp.Header.Get("Content-Type")) {
+		writeJSONError(w, http.StatusBadGateway, upstreamHTMLResponseMessage(route.APIBackend))
 		return
 	}
 	evidence := newSearchEvidence()
@@ -211,8 +246,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	s.logSearchEvidence(route.ChannelID, request, evidence)
 	var result canonicalResult
 	if request.Protocol == wireMessages {
-		s.replays.captureMessages(route.ChannelID, data)
-		result, err = canonicalFromMessages(data)
+		result, err = canonicalFromMessages(data, request.HostedWebSearch, request.SearchQuery)
 	} else {
 		result, err = canonicalFromChat(data, request.HostedWebSearch, request.SearchQuery)
 	}
@@ -221,8 +255,15 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusBadGateway, "invalid upstream response: "+err.Error())
 		return
 	}
+	if request.Protocol == wireMessages {
+		s.replays.captureMessages(route.ChannelID, request.ReplayScope, data)
+	}
 	canonical := canonicalResponse(route, request, result)
 	restoreClientWebSearchAlias(canonical, request.ClientSearchAlias)
+	backfillResponseSearchSources(canonical, request.HostedWebSearch, request.SearchQuery)
+	if request.Stream {
+		s.log.Printf("UP channel=%s backend=%s ignored stream=true; emitting buffered JSON fallback", route.ChannelID, route.APIBackend)
+	}
 	if writeErr := writeCanonicalResponse(w, canonical, request.Stream); writeErr != nil {
 		writeJSONError(w, http.StatusBadGateway, "canonical response error: "+writeErr.Error())
 	}
@@ -247,6 +288,15 @@ func isJSONContentType(value string) bool {
 	}
 	mediaType = strings.ToLower(mediaType)
 	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
+func isHTMLContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && (strings.EqualFold(mediaType, "text/html") || strings.EqualFold(mediaType, "application/xhtml+xml"))
+}
+
+func upstreamHTMLResponseMessage(backend string) string {
+	return fmt.Sprintf("upstream returned HTML instead of a %s JSON response; check the channel base_url API prefix and api_backend", backend)
 }
 
 func isLoopbackRequestHost(value string) bool {

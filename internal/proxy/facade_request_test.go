@@ -3,7 +3,6 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -84,54 +83,6 @@ func TestFacadeUsesProviderSpecificHostedSearchDialect(t *testing.T) {
 	}
 }
 
-func TestFacadeFiltersHostedSearchToDetectedCapabilities(t *testing.T) {
-	tests := []struct {
-		name         string
-		web          bool
-		x            bool
-		wantWeb      int
-		wantX        int
-		wantFunction int
-	}{
-		{name: "web only", web: true, wantWeb: 1},
-		{name: "x only", x: true, wantX: 1},
-		{name: "both", web: true, x: true, wantWeb: 1, wantX: 1},
-		{name: "none preserves ordinary search function", wantFunction: 1},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			route := config.Route{
-				ChannelID:             "grok-relay",
-				APIBackend:            "responses",
-				WireModel:             "grok-4.5",
-				SupportsBackendSearch: test.web || test.x,
-				HostedSearchKnown:     true,
-				HostedWebSearch:       test.web,
-				HostedXSearch:         test.x,
-			}
-			request, err := adaptFacadeRequest([]byte(`{
-				"input":"search",
-				"tools":[
-					{"type":"function","name":"web_search","parameters":{}},
-					{"type":"function","name":"save","parameters":{}},
-					{"type":"web_search"},
-					{"type":"x_search"}
-				]
-			}`), route, newSearchReplayCache())
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, _, hosted, functionSearch, xSearch := summarizeBody(request.Body)
-			if hosted != test.wantWeb || xSearch != test.wantX || functionSearch != test.wantFunction {
-				t.Fatalf("hosted=%d function=%d x=%d body=%s", hosted, functionSearch, xSearch, request.Body)
-			}
-			if !strings.Contains(string(request.Body), `"save"`) {
-				t.Fatalf("unrelated function was removed: %s", request.Body)
-			}
-		})
-	}
-}
-
 func TestFacadePreservesClientSearchOnEveryUpstreamProtocol(t *testing.T) {
 	body := []byte(`{
 		"input":"search then fetch",
@@ -161,10 +112,10 @@ func TestFacadePreservesClientSearchOnEveryUpstreamProtocol(t *testing.T) {
 	}
 }
 
-func TestFacadeForcesClientSearchForExplicitUserIntentOnEveryProtocol(t *testing.T) {
+func TestFacadePreservesStructuredClientSearchChoiceOnEveryProtocol(t *testing.T) {
 	body := []byte(`{
 		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Use web_search to find the latest Grok Build release."}]}],
-		"tool_choice":"auto",
+		"tool_choice":{"type":"function","name":"web_search"},
 		"tools":[
 			{"type":"function","name":"web_search","description":"Search","parameters":{"type":"object"}},
 			{"type":"function","name":"web_fetch","description":"Fetch","parameters":{"type":"object"}}
@@ -180,8 +131,8 @@ func TestFacadeForcesClientSearchForExplicitUserIntentOnEveryProtocol(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !request.ClientSearchForced || request.HostedWebSearch || request.ClientSearchAlias == "" {
-				t.Fatalf("client search was not selected for %s: request=%+v body=%s", backend, request, request.Body)
+			if request.HostedWebSearch || request.ClientSearchAlias == "" {
+				t.Fatalf("structured client search choice was not preserved for %s: request=%+v body=%s", backend, request, request.Body)
 			}
 
 			root, err := decodeRequestObject(request.Body)
@@ -214,76 +165,41 @@ func TestFacadeForcesClientSearchForExplicitUserIntentOnEveryProtocol(t *testing
 	}
 }
 
-func TestFacadeForcesActualGrokSubagentClientSearchShape(t *testing.T) {
-	body := []byte(`{
-		"input":[
-			{"type":"message","role":"system","content":"system prompt"},
-			{"type":"message","role":"developer","content":"subagent instructions"},
-			{"type":"message","role":"user","content":"Call the web_search tool to find the current stable Python 3 release from python.org; return one source URL. Do not use web_fetch as a substitute."}
-		],
-		"tools":[
-			{"type":"function","name":"web_search","parameters":{"type":"object"}},
-			{"type":"function","name":"web_fetch","parameters":{"type":"object"}}
-		]
-	}`)
-	request, err := adaptFacadeRequest(body, config.Route{
-		ChannelID:  "subagent-client-search",
-		APIBackend: "responses",
-		WireModel:  "grok-4.5",
-	}, newSearchReplayCache())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !request.ClientSearchForced || request.ClientSearchAlias == "" {
-		t.Fatalf("actual Grok subagent request was not forced to web_search: %s", request.Body)
-	}
-	root, err := decodeRequestObject(request.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	choice, _ := root["tool_choice"].(map[string]any)
-	if stringValue(choice["type"]) != "function" || stringValue(choice["name"]) != request.ClientSearchAlias {
-		t.Fatalf("wrong Responses tool choice: %#v", root["tool_choice"])
-	}
-}
-
-func TestFacadeClientSearchRespectsAllowedToolsChoice(t *testing.T) {
-	tools := `"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"function","name":"web_fetch","parameters":{"type":"object"}}]`
-	tests := []struct {
-		name   string
-		choice string
-		forced bool
-	}{
-		{
-			name:   "web search allowed",
-			choice: `{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"web_search"},{"type":"function","name":"web_fetch"}]}`,
-			forced: true,
-		},
-		{
-			name:   "required web search allowed",
-			choice: `{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"web_search"}]}`,
-			forced: true,
-		},
-		{
-			name:   "web search excluded",
-			choice: `{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"web_fetch"}]}`,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			body := `{"input":"Call the web_search tool for the latest release",` + tools + `,"tool_choice":` + test.choice + `}`
-			request, err := adaptFacadeRequest([]byte(body), config.Route{
-				ChannelID:  "allowed-tools",
-				APIBackend: "responses",
-				WireModel:  "model-real",
-			}, newSearchReplayCache())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if request.ClientSearchForced != test.forced {
-				t.Fatalf("forced=%t want %t: %s", request.ClientSearchForced, test.forced, request.Body)
-			}
+func TestFacadeDoesNotInferClientSearchChoiceFromPrompt(t *testing.T) {
+	for _, prompt := range []string{
+		"Use web_search to find the latest release.",
+		"不要用网络搜索，直接回答。",
+		"Call spawn_subagent and ask the child to use web_search.",
+	} {
+		body, err := json.Marshal(map[string]any{
+			"input":       prompt,
+			"tool_choice": "auto",
+			"tools": []any{
+				map[string]any{"type": "function", "name": "web_search", "parameters": map[string]any{"type": "object"}},
+				map[string]any{"type": "function", "name": "web_fetch", "parameters": map[string]any{"type": "object"}},
+			},
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, err := adaptFacadeRequest(body, config.Route{
+			ChannelID:  "client-search",
+			APIBackend: "responses",
+			WireModel:  "model-real",
+		}, newSearchReplayCache())
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := decodeRequestObject(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if root["tool_choice"] != "auto" {
+			t.Fatalf("prompt changed structured tool choice for %q: %#v", prompt, root["tool_choice"])
+		}
+		if request.ClientSearchAlias == "" || !strings.Contains(string(request.Body), "configured client web-search model") {
+			t.Fatalf("client search tool was not described and aliased: %s", request.Body)
+		}
 	}
 }
 
@@ -361,125 +277,6 @@ func TestMessagesConversionRejectsInvalidFunctionArguments(t *testing.T) {
 	}
 }
 
-func TestFacadeClientSearchDoesNotHijackExplicitSubagentDelegation(t *testing.T) {
-	base := `{
-		"input":"Call spawn_subagent exactly once. Tell the child: Call the web_search tool for the latest release. Do not search in the parent.",
-		"tools":[
-			{"type":"function","name":"web_search","parameters":{"type":"object"}},
-			%s
-		]
-	}`
-	for _, test := range []struct {
-		name       string
-		secondTool string
-		wantForced bool
-	}{
-		{
-			name:       "subagent tool available",
-			secondTool: `{"type":"function","name":"spawn_subagent","parameters":{"type":"object"}}`,
-		},
-		{
-			name:       "no subagent tool available",
-			secondTool: `{"type":"function","name":"web_fetch","parameters":{"type":"object"}}`,
-			wantForced: true,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			request, err := adaptFacadeRequest([]byte(fmt.Sprintf(base, test.secondTool)), config.Route{
-				ChannelID:  "delegation",
-				APIBackend: "responses",
-				WireModel:  "model-real",
-			}, newSearchReplayCache())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if request.ClientSearchForced != test.wantForced {
-				t.Fatalf("forced=%t want %t: %s", request.ClientSearchForced, test.wantForced, request.Body)
-			}
-		})
-	}
-}
-
-func TestFacadeClientSearchSelectionDoesNotLoopOrOverrideUserChoice(t *testing.T) {
-	route := config.Route{ChannelID: "client-search", APIBackend: "responses", WireModel: "model-real"}
-	tools := `"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"function","name":"web_fetch","parameters":{"type":"object"}}]`
-	tests := []struct {
-		name string
-		body string
-	}{
-		{name: "ordinary prompt", body: `{"input":"hi",` + tools + `}`},
-		{name: "ordinary tool discussion", body: `{"input":"Explain how the web_search tool is implemented.",` + tools + `}`},
-		{name: "explicit denial", body: `{"input":"Do not use web_search; answer from the supplied text.",` + tools + `}`},
-		{name: "fetch with call denial", body: `{"input":"Call web_fetch for this known URL; do not call web_search.",` + tools + `}`},
-		{name: "tool result follow-up", body: `{"input":[{"type":"message","role":"user","content":"Use web_search for current news"},{"type":"function_call","name":"web_search","call_id":"call_1","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"result"}],` + tools + `}`},
-		{name: "caller selected fetch", body: `{"input":"Use web_search first",` + tools + `,"tool_choice":{"type":"function","name":"web_fetch"}}`},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request, err := adaptFacadeRequest([]byte(test.body), route, newSearchReplayCache())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if request.ClientSearchForced {
-				t.Fatalf("client search was unexpectedly forced: %s", request.Body)
-			}
-		})
-	}
-
-	hosted, err := adaptFacadeRequest([]byte(`{"input":"Use web_search for the latest news"}`), config.Route{
-		ChannelID:             "hosted",
-		APIBackend:            "responses",
-		WireModel:             "gpt-search",
-		SupportsBackendSearch: true,
-	}, newSearchReplayCache())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hosted.ClientSearchForced || !hosted.HostedWebSearch {
-		t.Fatalf("hosted search was routed through the client selector: %+v", hosted)
-	}
-}
-
-func TestUserWebSearchIntentRespectsNaturalLanguageDenials(t *testing.T) {
-	for _, prompt := range []string{
-		"Do not search the web. Answer the latest version from memory.",
-		"Don't browse online; tell me today's date from memory.",
-		"不要联网，直接回答今天是什么日期。",
-		"离线回答最新版本是什么。",
-	} {
-		if userRequestsWebSearch(prompt) {
-			t.Fatalf("explicit offline request triggered search: %q", prompt)
-		}
-	}
-}
-
-func TestUserWebSearchIntentDoesNotTreatLocalOrAmbiguousRequestsAsWebSearch(t *testing.T) {
-	for _, prompt := range []string{
-		"检查一下这段代码。",
-		"查一下这个本地函数为什么报错。",
-		"show the latest local git commit",
-		"summarize today's meeting notes",
-		"实时更新终端里的进度条",
-	} {
-		if userRequestsWebSearch(prompt) {
-			t.Fatalf("local or ambiguous request triggered search: %q", prompt)
-		}
-	}
-}
-
-func TestUserWebSearchIntentRecognizesExplicitAndSpecificFreshnessRequests(t *testing.T) {
-	for _, prompt := range []string{
-		"Search the web for the Grok Build repository.",
-		"联网查询 Grok Build 的最新提交。",
-		"What is the current weather in Shanghai?",
-		"请告诉我 Python 的最新版本。",
-	} {
-		if !userRequestsWebSearch(prompt) {
-			t.Fatalf("web request did not trigger search: %q", prompt)
-		}
-	}
-}
-
 func TestFacadePreparesBuildClientSearchExecution(t *testing.T) {
 	request, err := adaptFacadeRequest([]byte(`{
 		"model":"deepseek-v4-flash",
@@ -490,16 +287,14 @@ func TestFacadePreparesBuildClientSearchExecution(t *testing.T) {
 		"max_output_tokens":8192,
 		"tools":[{"type":"web_search","filters":{"allowed_domains":["github.com"]}}]
 	}`), config.Route{
-		ChannelID:         "deepseek-v4-flash",
-		APIBackend:        "responses",
-		WireModel:         "deepseek-v4-flash",
-		HostedSearchKnown: true,
-		HostedXSearch:     true,
+		ChannelID:  "deepseek-v4-flash",
+		APIBackend: "responses",
+		WireModel:  "deepseek-v4-flash",
 	}, newSearchReplayCache())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !request.ClientSearchPrepared || request.ClientSearchForced || request.ProxyAddedWebSearch {
+	if !request.ClientSearchPrepared || request.ProxyAddedWebSearch {
 		t.Fatalf("Build client-search execution was not recognized: %+v", request)
 	}
 	root, err := decodeRequestObject(request.Body)
@@ -640,7 +435,7 @@ func TestChatReplayPreservesReasoningOrderingAndToolResultImages(t *testing.T) {
 
 func TestMessagesReplayPreservesThinkingBackendAndImageResult(t *testing.T) {
 	cache := newSearchReplayCache()
-	cache.captureMessages("deepseek", []byte(`{
+	cache.captureMessages("deepseek", "", []byte(`{
 		"content":[
 			{"type":"server_tool_use","id":"ws_1","name":"web_search","input":{"query":"q"}},
 			{"type":"web_search_tool_result","tool_use_id":"ws_1","content":[{"type":"web_search_result","url":"https://example.test","title":"Example","page_age":"today","encrypted_content":"opaque"}]}
@@ -648,7 +443,10 @@ func TestMessagesReplayPreservesThinkingBackendAndImageResult(t *testing.T) {
 	}`))
 	input := []any{
 		map[string]any{"type": "reasoning", "content": []any{map[string]any{"type": "reasoning_text", "text": "think"}}, "encrypted_content": "sig"},
-		map[string]any{"type": "web_search_call", "id": "ws_1", "action": map[string]any{"type": "search", "query": "q"}},
+		map[string]any{"type": "web_search_call", "id": "ws_1", "action": map[string]any{
+			"type": "search", "query": "q",
+			"sources": []any{map[string]any{"type": "url", "url": "https://example.test", "title": "Example"}},
+		}},
 		map[string]any{"type": "function_call", "call_id": "call_1", "name": "save", "arguments": `{}`},
 		map[string]any{"type": "function_call_output", "call_id": "call_1", "output": []any{
 			map[string]any{"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
@@ -752,7 +550,7 @@ func TestSafeUpstreamErrorRedactsURLSecrets(t *testing.T) {
 
 func TestDeepSeekReplayCacheIsExactAndChannelScoped(t *testing.T) {
 	cache := newSearchReplayCache()
-	cache.captureJSON("one", []byte(`{"type":"response.completed","response":{"output":[{"type":"web_search_call","id":"ws_1","action":{"type":"search","query":"q","queries":["q","q latest","ws_call_id=ws_1"]}}]}}`))
+	cache.captureJSON("one", replayConversationFingerprint([]any{}), []byte(`{"type":"response.completed","response":{"output":[{"type":"web_search_call","id":"ws_1","action":{"type":"search","query":"q","queries":["q","q latest","ws_call_id=ws_1"]}}]}}`))
 	makeRoot := func() map[string]any {
 		var root map[string]any
 		_ = json.Unmarshal([]byte(`{"input":[{"type":"web_search_call","id":"ws_1","action":{"type":"search","query":"q"}}]}`), &root)
@@ -836,29 +634,39 @@ func TestChatHostedSearchChoiceKeepsOrdinaryFunctions(t *testing.T) {
 	}
 }
 
-func TestChatHostedSearchUsesDetectedWebSearchOptionsDialect(t *testing.T) {
-	root, err := decodeRequestObject([]byte(`{
-		"model":"grok-real",
-		"input":"search now",
-		"tools":[{"type":"web_search"}],
-		"tool_choice":"required"
-	}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	converted, err := responsesToChatRequest(root, config.Route{
-		ChannelID:               "grok2api-chat",
-		WireModel:               "grok-real",
-		Host:                    "relay.test",
-		HostedChatSearchDialect: config.ChatSearchDialectWebSearchOptions,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := converted["web_search_options"]; !exists {
-		t.Fatalf("detected web_search_options dialect was not used: %#v", converted)
-	}
-	if _, exists := converted["search_parameters"]; exists {
-		t.Fatalf("both Chat search dialects were sent: %#v", converted)
+func TestChatHostedSearchUsesDeterministicProviderDialect(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		route     config.Route
+		wantField string
+	}{
+		{name: "Grok relay", route: config.Route{ChannelID: "grok-chat", WireModel: "grok-real"}, wantField: "search_parameters"},
+		{name: "generic relay", route: config.Route{ChannelID: "generic-chat", WireModel: "model-real"}, wantField: "web_search_options"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, err := decodeRequestObject([]byte(`{
+				"model":"configured",
+				"input":"search now",
+				"tools":[{"type":"web_search"}],
+				"tool_choice":"required"
+			}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			converted, err := responsesToChatRequest(root, test.route)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := converted[test.wantField]; !exists {
+				t.Fatalf("%s dialect was not used: %#v", test.wantField, converted)
+			}
+			other := "search_parameters"
+			if test.wantField == other {
+				other = "web_search_options"
+			}
+			if _, exists := converted[other]; exists {
+				t.Fatalf("both Chat search dialects were sent: %#v", converted)
+			}
+		})
 	}
 }

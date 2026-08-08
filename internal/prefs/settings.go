@@ -9,8 +9,16 @@ import (
 
 const settingsFileName = "settings.json"
 
+const DefaultLogRetentionUsageDays = 7
+
 type settings struct {
-	ProxyEnabled bool `json:"proxy_enabled"`
+	ProxyEnabled          bool `json:"proxy_enabled"`
+	LogRetentionUsageDays int  `json:"log_retention_usage_days"`
+}
+
+type storedSettings struct {
+	ProxyEnabled          *bool `json:"proxy_enabled"`
+	LogRetentionUsageDays *int  `json:"log_retention_usage_days"`
 }
 
 func Path(dataDir string) string {
@@ -18,22 +26,81 @@ func Path(dataDir string) string {
 }
 
 func ProxyEnabled(path string) (bool, error) {
-	raw, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return true, nil
-	}
+	current, err := load(path)
 	if err != nil {
 		return false, err
-	}
-	var current settings
-	if err := json.Unmarshal(raw, &current); err != nil {
-		return false, fmt.Errorf("decode settings: %w", err)
 	}
 	return current.ProxyEnabled, nil
 }
 
 func SetProxyEnabled(path string, enabled bool) error {
-	raw, err := json.MarshalIndent(settings{ProxyEnabled: enabled}, "", "  ")
+	current, err := load(path)
+	if err != nil {
+		return err
+	}
+	current.ProxyEnabled = enabled
+	return write(path, current)
+}
+
+func LogRetentionUsageDays(path string) (int, error) {
+	current, err := load(path)
+	if err != nil {
+		return 0, err
+	}
+	return current.LogRetentionUsageDays, nil
+}
+
+func SetLogRetentionUsageDays(path string, days int) error {
+	if !ValidLogRetentionUsageDays(days) {
+		return fmt.Errorf("unsupported log retention usage days %d", days)
+	}
+	current, err := load(path)
+	if err != nil {
+		return err
+	}
+	current.LogRetentionUsageDays = days
+	return write(path, current)
+}
+
+func ValidLogRetentionUsageDays(days int) bool {
+	switch days {
+	case 0, 3, 7, 14, 30:
+		return true
+	default:
+		return false
+	}
+}
+
+func load(path string) (settings, error) {
+	current := settings{
+		ProxyEnabled:          true,
+		LogRetentionUsageDays: DefaultLogRetentionUsageDays,
+	}
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return current, nil
+	}
+	if err != nil {
+		return settings{}, err
+	}
+	var stored storedSettings
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return settings{}, fmt.Errorf("decode settings: %w", err)
+	}
+	if stored.ProxyEnabled != nil {
+		current.ProxyEnabled = *stored.ProxyEnabled
+	}
+	if stored.LogRetentionUsageDays != nil {
+		if !ValidLogRetentionUsageDays(*stored.LogRetentionUsageDays) {
+			return settings{}, fmt.Errorf("decode settings: unsupported log retention usage days %d", *stored.LogRetentionUsageDays)
+		}
+		current.LogRetentionUsageDays = *stored.LogRetentionUsageDays
+	}
+	return current, nil
+}
+
+func write(path string, current settings) error {
+	raw, err := json.MarshalIndent(current, "", "  ")
 	if err != nil {
 		return err
 	}

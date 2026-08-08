@@ -3,7 +3,7 @@ param(
     [int]$TimeoutSeconds = 150,
     [int]$MaxTurns = 1,
     [string]$Prompt = "Reply with exactly: OK. Do not call tools.",
-    [string]$SearchPrompt = "Use web search now to find the latest commit in the public xai-org/grok-build GitHub repository. Reply with the repository name and the first 7 characters of the current HEAD commit. Discover the page through search and do not answer from memory.",
+    [string]$SearchPrompt = "Call web_search exactly once to find the latest commit in the public xai-org/grok-build GitHub repository. After that tool result, do not call any tool again. Reply with the repository name and the first 7 characters of the current HEAD commit. Do not answer from memory.",
     [string]$SubagentSearchPrompt = "Call spawn_subagent exactly once with subagent_type general-purpose. Tell the child to use web_search now to find the latest commit in the public xai-org/grok-build GitHub repository and return the repository name, the first 7 characters of the current HEAD commit, and a source URL. Do not search in the parent. Wait for the child and return its result.",
     [string]$FetchPrompt = "Use the web_fetch tool, not web_search, to fetch https://example.com/ and reply with the page title.",
     [string]$ExpectedSubagentModel = "",
@@ -79,7 +79,7 @@ $results = foreach ($model in $Models) {
     } else {
         0
     }
-    $effectiveMaxTurns = if ($RequireSubagentSearch -and $MaxTurns -lt 4) { 4 } elseif ($RequireWebFetch -and $MaxTurns -lt 2) { 2 } else { $MaxTurns }
+    $effectiveMaxTurns = if ($RequireSubagentSearch -and $MaxTurns -lt 4) { 4 } elseif (($RequireWebSearch -or $RequireWebFetch) -and $MaxTurns -lt 2) { 2 } else { $MaxTurns }
     $quotedPrompt = '"' + ($effectivePrompt -replace '"', '\"') + '"'
     $args = @(
         "-p", $quotedPrompt,
@@ -315,7 +315,7 @@ $results = foreach ($model in $Models) {
                     $message -match '(?i)(?<![0-9a-f])[0-9a-f]{7}(?![0-9a-f])'
                 if ($RequireSubagentSearch) {
                     $parentDidNotStealSearch = $channelRequestLines.Count -gt 0 -and
-                        [string]$channelRequestLines[0] -match 'client_web_search_forced=false'
+                        [string]$channelRequestLines[0] -match 'client_web_search_prepared=false'
                     # Grok Build intentionally excludes project-layer
                     # [subagents.models] from trust-independent model
                     # resolution. Cross-model probes must therefore configure
@@ -329,8 +329,8 @@ $results = foreach ($model in $Models) {
                     if ($expectedChildModel -eq $model) {
                         $childRequestLines = @($childRequestLines | Select-Object -Skip 1)
                     }
-                    $childClientSearch = [bool](@($childRequestLines | Where-Object {
-                        $_ -match 'client_web_search_forced=true'
+                    $childClientSearch = [bool](@($newLogLines | Where-Object {
+                        $_ -match 'client_web_search_prepared=true'
                     }).Count)
                     $childHostedSearch = [bool]($newLogLines | Where-Object {
                         $_ -match "UP channel=$escapedChildModel search evidence declared=true .*calls=[1-9][0-9]* completed=[1-9][0-9]*"
@@ -377,7 +377,7 @@ $results = foreach ($model in $Models) {
             try {
                 $result = Get-Content -Raw -LiteralPath $stdout | ConvertFrom-Json -Depth 100
                 $message = ([string]$result.text -replace '\s+', ' ').Trim()
-                if ($Prompt -eq "Reply with exactly: OK. Do not call tools." -and $message -cne "OK") {
+                if ($Prompt -eq "Reply with exactly: OK. Do not call tools." -and $message -notmatch '^(?i:OK)[.!]?$') {
                     $status = "failed"
                     $message = "unexpected reply to exact-OK probe: $message"
                 }

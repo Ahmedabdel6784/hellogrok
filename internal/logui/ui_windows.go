@@ -9,12 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/hellowind777/hellogrok/internal/appinfo"
+	"github.com/hellowind777/hellogrok/internal/dialog"
+	"github.com/hellowind777/hellogrok/internal/prefs"
 )
 
 // StatusFunc returns short title + detail text for the status panel.
@@ -42,13 +45,17 @@ var (
 	pSendMessageW     = user32.NewProc("SendMessageW")
 	pGetClientRect    = user32.NewProc("GetClientRect")
 	pMoveWindow       = user32.NewProc("MoveWindow")
+	pInvalidateRect   = user32.NewProc("InvalidateRect")
+	pSetWindowPos     = user32.NewProc("SetWindowPos")
 	pDestroyWindow    = user32.NewProc("DestroyWindow")
 	pSetTimer         = user32.NewProc("SetTimer")
 	pKillTimer        = user32.NewProc("KillTimer")
 	pSetForeground    = user32.NewProc("SetForegroundWindow")
+	pSetFocus         = user32.NewProc("SetFocus")
 	pGetStockObject   = gdi32.NewProc("GetStockObject")
 	pGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
 	pGetLastError     = kernel32.NewProc("GetLastError")
+	pRtlMoveMemory    = kernel32.NewProc("RtlMoveMemory")
 	pGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 	pGetWindowRect    = user32.NewProc("GetWindowRect")
 
@@ -63,53 +70,79 @@ var (
 )
 
 const (
-	wsOverlappedWindow = 0x00CF0000
-	wsChild            = 0x40000000
-	wsVisible          = 0x10000000
-	wsVScroll          = 0x00200000
-	wsHScroll          = 0x00100000
-	wsBorder           = 0x00800000
-	wsClipSiblings     = 0x04000000
-	esMultiline        = 0x0004
-	esReadonly         = 0x0800
-	esAutovscroll      = 0x0040
-	esAutohscroll      = 0x0080
-	esWantreturn       = 0x1000
-	swShow             = 5
-	swRestore          = 9
-	wmDestroy          = 0x0002
-	wmSize             = 0x0005
-	wmSetFont          = 0x0030
-	wmSetIcon          = 0x0080
-	wmSetText          = 0x000C
-	wmGetTextLength    = 0x000E
-	wmSetSel           = 0x00B1
-	wmReplaceSel       = 0x00C2
-	emSetLimitText     = 0x00C5
-	emScrollCaret      = 0x00B7
-	wmTimer            = 0x0113
-	wmClose            = 0x0010
-	idcArrow           = 32512
-	colorWindow        = 5
-	defaultGUIFont     = 17
-	imageIcon          = 1
-	iconSmall          = 0
-	iconBig            = 1
-	lrShared           = 0x00008000
-	appIconResourceID  = 1
-	timerID            = 1
-	statusHeight       = 120
-	errClassExists     = 1410
-	smCXScreen         = 0
-	smCYScreen         = 1
-	smCXIcon           = 11
-	smCYIcon           = 12
-	smCXSmallIcon      = 49
-	smCYSmallIcon      = 50
-	// default monitor size: narrower than before
-	defaultWinW                = 720
-	defaultWinH                = 560
-	logTailBytes         int64 = 96 * 1024
+	wsOverlappedWindow         = 0x00CF0000
+	wsChild                    = 0x40000000
+	wsVisible                  = 0x10000000
+	wsVScroll                  = 0x00200000
+	wsHScroll                  = 0x00100000
+	wsBorder                   = 0x00800000
+	wsClipSiblings             = 0x04000000
+	wsTabStop                  = 0x00010000
+	esMultiline                = 0x0004
+	esReadonly                 = 0x0800
+	esAutovscroll              = 0x0040
+	esAutohscroll              = 0x0080
+	esWantreturn               = 0x1000
+	ssCenterImage              = 0x0200
+	ssSunken                   = 0x1000
+	cbsDropdownList            = 0x0003
+	swShow                     = 5
+	swRestore                  = 9
+	wmDestroy                  = 0x0002
+	wmSize                     = 0x0005
+	wmGetMinMaxInfo            = 0x0024
+	wmSetFont                  = 0x0030
+	wmSetIcon                  = 0x0080
+	wmSetText                  = 0x000C
+	wmGetText                  = 0x000D
+	wmGetTextLength            = 0x000E
+	wmCommand                  = 0x0111
+	wmSetSel                   = 0x00B1
+	wmReplaceSel               = 0x00C2
+	emSetLimitText             = 0x00C5
+	emScrollCaret              = 0x00B7
+	emSetCueBanner             = 0x1501
+	cbAddString                = 0x0143
+	cbGetCurSel                = 0x0147
+	cbSetCurSel                = 0x014E
+	wmTimer                    = 0x0113
+	wmClose                    = 0x0010
+	idcArrow                   = 32512
+	colorWindow                = 5
+	defaultGUIFont             = 17
+	imageIcon                  = 1
+	iconSmall                  = 0
+	iconBig                    = 1
+	lrShared                   = 0x00008000
+	appIconResourceID          = 1
+	timerID                    = 1
+	statusHeight               = 170
+	toolbarHeight              = 38
+	toolbarControlH            = 24
+	retentionComboH            = 150
+	retentionControlID         = 1001
+	searchEditID               = 1002
+	searchButtonID             = 1003
+	cbnSelChange               = 1
+	bnClicked                  = 0
+	hwndBottom                 = 1
+	swpNoSize                  = 0x0001
+	swpNoMove                  = 0x0002
+	swpNoActivate              = 0x0010
+	errClassExists             = 1410
+	smCXScreen                 = 0
+	smCYScreen                 = 1
+	smCXIcon                   = 11
+	smCYIcon                   = 12
+	smCXSmallIcon              = 49
+	smCYSmallIcon              = 50
+	legacyDefaultWinW          = 720
+	legacyDefaultWinH          = 560
+	defaultWinW                = 800
+	defaultWinH                = 680
+	minimumWinW                = 420
+	minimumWinH                = 360
+	logTailBytes         int64 = 4 << 20
 	maxLogIncrementBytes int64 = 1 << 20
 	maxLogEditCharacters       = 7 << 20
 )
@@ -140,14 +173,48 @@ type msg struct {
 }
 type rect struct{ Left, Top, Right, Bottom int32 }
 
+type minMaxInfo struct {
+	Reserved     point
+	MaxSize      point
+	MaxPosition  point
+	MinTrackSize point
+	MaxTrackSize point
+}
+
+type retentionChoice struct {
+	days  int
+	label string
+}
+
+var retentionChoices = []retentionChoice{
+	{days: 0, label: "关闭"},
+	{days: 3, label: "3 个使用日"},
+	{days: 7, label: "7 个使用日"},
+	{days: 14, label: "14 个使用日"},
+	{days: 30, label: "30 个使用日"},
+}
+
 type winState struct {
-	path       string
-	status     StatusFunc
-	editSt     uintptr
-	editLg     uintptr
-	offset     int64
-	hwnd       uintptr
-	lastStatus string // skip SetText when unchanged — preserves user selection/copy
+	path           string
+	status         StatusFunc
+	getRetention   func() (int, error)
+	setRetention   func(int) error
+	editSt         uintptr
+	toolbar        uintptr
+	retentionLabel uintptr
+	retentionCombo uintptr
+	searchEdit     uintptr
+	searchButton   uintptr
+	editLg         uintptr
+	offset         int64
+	hwnd           uintptr
+	retentionDays  int
+	lastStatus     string // skip SetText when unchanged to preserve selection/copy
+	searchQuery    string
+	searchAfter    int
+	searchActive   bool
+	searchSelStart uintptr
+	searchSelEnd   uintptr
 }
 
 func lastErr() uint32 {
@@ -162,12 +229,17 @@ func logf(format string, args ...any) {
 	if err != nil {
 		return
 	}
-	_, _ = fmt.Fprintf(f, "[logui] %s %s\n", time.Now().Format("15:04:05"), msg)
+	_, _ = fmt.Fprintf(f, "%s [logui] %s\n", time.Now().Format("2006/01/02 15:04:05"), msg)
 	_ = f.Close()
 }
 
 // Open shows status + live log. Closing the window does not stop the tray proxy.
-func Open(path string, status StatusFunc) error {
+func Open(
+	path string,
+	status StatusFunc,
+	getRetention func() (int, error),
+	setRetention func(int) error,
+) error {
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
@@ -196,7 +268,7 @@ func Open(path string, status StatusFunc) error {
 
 	go func() {
 		runtime.LockOSThread()
-		hwnd, st, err := buildWindow(path, status)
+		hwnd, st, err := buildWindow(path, status, getRetention, setRetention)
 		if err != nil {
 			logf("buildWindow failed: %v", err)
 			ready <- readyMsg{err: err}
@@ -216,7 +288,12 @@ func Open(path string, status StatusFunc) error {
 	}
 }
 
-func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
+func buildWindow(
+	path string,
+	status StatusFunc,
+	getRetention func() (int, error),
+	setRetention func(int) error,
+) (uintptr, *winState, error) {
 	hInstance, _, _ := pGetModuleHandleW.Call(0)
 	largeIcon := loadWindowIcon(hInstance, smCXIcon, smCYIcon)
 	smallIcon := loadWindowIcon(hInstance, smCXSmallIcon, smCYSmallIcon)
@@ -250,7 +327,11 @@ func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 		return 0, nil, classRegErr
 	}
 
-	st := &winState{path: path, status: status}
+	st := &winState{
+		path: path, status: status,
+		getRetention: getRetention, setRetention: setRetention,
+		retentionDays: prefs.DefaultLogRetentionUsageDays,
+	}
 	title, _ := syscall.UTF16PtrFromString("hellogrok — 状态与日志（关闭不影响代理）")
 	x, y, w, h := loadGeometry()
 	hwnd, _, callErr := pCreateWindowExW.Call(
@@ -292,10 +373,52 @@ func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 		pDestroyWindow.Call(hwnd)
 		return 0, nil, err
 	}
+	staticClass, _ := syscall.UTF16PtrFromString("STATIC")
+	comboClass, _ := syscall.UTF16PtrFromString("COMBOBOX")
+	buttonClass, _ := syscall.UTF16PtrFromString("BUTTON")
+	createChild := func(class *uint16, text string, style uintptr, id int, height int) (uintptr, error) {
+		caption, _ := syscall.UTF16PtrFromString(text)
+		h, _, e := pCreateWindowExW.Call(
+			0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(caption)), style,
+			0, 0, 100, uintptr(height), hwnd, uintptr(id), hInstance, 0,
+		)
+		if h == 0 {
+			return 0, fmt.Errorf("create child control %d: %v last=%d", id, e, lastErr())
+		}
+		return h, nil
+	}
+	if st.toolbar, err = createChild(staticClass, "", wsChild|wsVisible|wsClipSiblings|ssSunken, 0, toolbarHeight); err != nil {
+		pDestroyWindow.Call(hwnd)
+		return 0, nil, err
+	}
+	if st.retentionLabel, err = createChild(staticClass, "自动清理天数", wsChild|wsVisible|ssCenterImage, 0, toolbarControlH); err != nil {
+		pDestroyWindow.Call(hwnd)
+		return 0, nil, err
+	}
+	if st.retentionCombo, err = createChild(comboClass, "", wsChild|wsVisible|wsVScroll|wsTabStop|cbsDropdownList, retentionControlID, retentionComboH); err != nil {
+		pDestroyWindow.Call(hwnd)
+		return 0, nil, err
+	}
+	if st.searchEdit, err = createChild(editClass, "", wsChild|wsVisible|wsBorder|wsTabStop|esAutohscroll, searchEditID, toolbarControlH); err != nil {
+		pDestroyWindow.Call(hwnd)
+		return 0, nil, err
+	}
+	if st.searchButton, err = createChild(buttonClass, "搜索", wsChild|wsVisible|wsTabStop, searchButtonID, toolbarControlH); err != nil {
+		pDestroyWindow.Call(hwnd)
+		return 0, nil, err
+	}
+	pSetWindowPos.Call(st.toolbar, hwndBottom, 0, 0, 0, 0, swpNoSize|swpNoMove|swpNoActivate)
 	pSendMessageW.Call(st.editLg, emSetLimitText, 8<<20, 0)
 	hfont, _, _ := pGetStockObject.Call(defaultGUIFont)
-	pSendMessageW.Call(st.editSt, wmSetFont, hfont, 1)
-	pSendMessageW.Call(st.editLg, wmSetFont, hfont, 1)
+	for _, control := range []uintptr{
+		st.editSt, st.toolbar, st.retentionLabel, st.retentionCombo,
+		st.searchEdit, st.searchButton, st.editLg,
+	} {
+		pSendMessageW.Call(control, wmSetFont, hfont, 1)
+	}
+	searchCue, _ := syscall.UTF16PtrFromString("搜索日志")
+	pSendMessageW.Call(st.searchEdit, emSetCueBanner, 1, uintptr(unsafe.Pointer(searchCue)))
+	initializeRetention(st)
 
 	refreshStatus(st)
 	st.offset = reloadLog(st, logTailBytes)
@@ -310,6 +433,8 @@ func buildWindow(path string, status StatusFunc) (uintptr, *winState, error) {
 
 	pShowWindow.Call(hwnd, swShow)
 	pUpdateWindow.Call(hwnd)
+	pInvalidateRect.Call(st.retentionCombo, 0, 1)
+	pUpdateWindow.Call(st.retentionCombo)
 	pSetForeground.Call(hwnd)
 	pSetTimer.Call(hwnd, timerID, 400, 0)
 	return hwnd, st, nil
@@ -365,6 +490,15 @@ func pump(hwnd uintptr, st *winState) {
 func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	st := stateFrom(hwnd)
 	switch msg {
+	case wmGetMinMaxInfo:
+		if lParam != 0 {
+			var info minMaxInfo
+			size := unsafe.Sizeof(info)
+			pRtlMoveMemory.Call(uintptr(unsafe.Pointer(&info)), lParam, size)
+			info.MinTrackSize = point{X: minimumWinW, Y: minimumWinH}
+			pRtlMoveMemory.Call(lParam, uintptr(unsafe.Pointer(&info)), size)
+		}
+		return 0
 	case wmSize:
 		if st != nil {
 			layout(st)
@@ -376,6 +510,20 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			appendNew(st)
 		}
 		return 0
+	case wmCommand:
+		if st == nil {
+			break
+		}
+		controlID := int(wParam & 0xffff)
+		notification := int((wParam >> 16) & 0xffff)
+		switch {
+		case controlID == retentionControlID && notification == cbnSelChange:
+			handleRetentionChange(st)
+			return 0
+		case controlID == searchButtonID && notification == bnClicked:
+			handleSearch(st)
+			return 0
+		}
 	case wmClose:
 		// remember geometry before destroy
 		if st != nil {
@@ -405,17 +553,62 @@ func layout(st *winState) {
 	if ok == 0 || width <= 0 || height <= 0 {
 		return
 	}
-	w := uintptr(width)  // #nosec G115 -- positive Win32 client dimensions are bounded by int32.
-	h := uintptr(height) // #nosec G115 -- positive Win32 client dimensions are bounded by int32.
-	sh := uintptr(statusHeight)
-	if h < sh+80 {
-		sh = h / 3
-	}
+	w := int(width)
+	h := int(height)
+	sh := statusPanelHeight(h)
 	if st.editSt != 0 {
-		pMoveWindow.Call(st.editSt, 0, 0, w, sh, 1)
+		pMoveWindow.Call(st.editSt, 0, 0, uintptr(w), uintptr(sh), 1)
+	}
+	if st.toolbar != 0 {
+		pMoveWindow.Call(st.toolbar, 0, uintptr(sh), uintptr(w), toolbarHeight, 1)
+	}
+
+	const (
+		margin        = 8
+		labelW        = 88
+		comboW        = 108
+		buttonW       = 56
+		controlGap    = 6
+		sectionGap    = 12
+		searchIdealW  = 180
+		searchMinimum = 72
+	)
+	searchW := w - 2*margin - labelW - comboW - buttonW - 2*controlGap - sectionGap
+	if searchW > searchIdealW {
+		searchW = searchIdealW
+	}
+	if searchW < searchMinimum {
+		searchW = searchMinimum
+	}
+	groupW := labelW + controlGap + comboW + sectionGap + searchW + controlGap + buttonW
+	x := w - margin - groupW
+	if x < margin {
+		x = margin
+	}
+	y := sh + (toolbarHeight-toolbarControlH)/2
+	move := func(control uintptr, left, width, height int) {
+		if control != 0 {
+			pMoveWindow.Call(control, uintptr(left), uintptr(y), uintptr(width), uintptr(height), 1)
+		}
+	}
+	move(st.retentionLabel, x, labelW, toolbarControlH)
+	x += labelW + controlGap
+	move(st.retentionCombo, x, comboW, retentionComboH)
+	x += comboW + sectionGap
+	move(st.searchEdit, x, searchW, toolbarControlH)
+	x += searchW + controlGap
+	move(st.searchButton, x, buttonW, toolbarControlH)
+	if st.retentionCombo != 0 {
+		pInvalidateRect.Call(st.retentionCombo, 0, 1)
+		pUpdateWindow.Call(st.retentionCombo)
+	}
+
+	logY := sh + toolbarHeight
+	if logY > h {
+		logY = h
 	}
 	if st.editLg != 0 {
-		pMoveWindow.Call(st.editLg, 0, sh, w, h-sh, 1)
+		pMoveWindow.Call(st.editLg, 0, uintptr(logY), uintptr(w), uintptr(h-logY), 1)
 	}
 }
 
@@ -424,17 +617,27 @@ func refreshStatus(st *winState) {
 	if st.status != nil {
 		short, detail = st.status()
 	}
-	text := "【状态】 " + short + "\r\n" +
-		"----------------------------------------\r\n" +
-		detail + "\r\n" +
-		"----------------------------------------\r\n" +
-		"下方为实时日志。关闭本窗口不会停止代理。"
+	text := "【运行状态】 " + short
+	if strings.TrimSpace(detail) != "" {
+		text += "\r\n\r\n" + toCRLF(detail)
+	}
 	// WM_SETTEXT clears selection; only update when content actually changes.
 	if text == st.lastStatus {
 		return
 	}
 	st.lastStatus = text
 	setEditText(st.editSt, text)
+}
+
+func statusPanelHeight(clientHeight int) int {
+	height := statusHeight
+	if clientHeight < height+toolbarHeight+80 {
+		height = (clientHeight - toolbarHeight) / 3
+		if height < 80 {
+			height = 80
+		}
+	}
+	return height
 }
 
 func reloadLog(st *winState, max int64) int64 {
@@ -446,6 +649,7 @@ func reloadLog(st *winState, max int64) int64 {
 	setEditText(st.editLg, "【日志】 "+st.path+"\r\n"+
 		"----------------------------------------\r\n"+
 		toCRLF(string(data)))
+	resetSearch(st)
 	scrollToEnd(st.editLg)
 	return size
 }
@@ -484,7 +688,119 @@ func appendNew(st *winState) {
 	}
 	st.offset += int64(len(buf))
 	appendEdit(st.editLg, toCRLF(string(buf)))
-	scrollToEnd(st.editLg)
+	if st.searchActive {
+		pSendMessageW.Call(st.editLg, wmSetSel, st.searchSelStart, st.searchSelEnd)
+		pSendMessageW.Call(st.editLg, emScrollCaret, 0, 0)
+	} else {
+		scrollToEnd(st.editLg)
+	}
+}
+
+func initializeRetention(st *winState) {
+	for _, choice := range retentionChoices {
+		label, _ := syscall.UTF16PtrFromString(choice.label)
+		pSendMessageW.Call(st.retentionCombo, cbAddString, 0, uintptr(unsafe.Pointer(label)))
+	}
+	if st.getRetention != nil {
+		days, err := st.getRetention()
+		if err != nil {
+			logf("load log retention preference failed: %v", err)
+		} else if prefs.ValidLogRetentionUsageDays(days) {
+			st.retentionDays = days
+		}
+	}
+	setRetentionSelection(st, st.retentionDays)
+}
+
+func setRetentionSelection(st *winState, days int) {
+	for index, choice := range retentionChoices {
+		if choice.days == days {
+			pSendMessageW.Call(st.retentionCombo, cbSetCurSel, uintptr(index), 0)
+			return
+		}
+	}
+}
+
+func handleRetentionChange(st *winState) {
+	selected, _, _ := pSendMessageW.Call(st.retentionCombo, cbGetCurSel, 0, 0)
+	index := int(int32(selected))
+	if index < 0 || index >= len(retentionChoices) {
+		return
+	}
+	days := retentionChoices[index].days
+	if days == st.retentionDays {
+		return
+	}
+	if st.setRetention == nil {
+		setRetentionSelection(st, st.retentionDays)
+		return
+	}
+	if err := st.setRetention(days); err != nil {
+		setRetentionSelection(st, st.retentionDays)
+		logf("save log retention preference failed: %v", err)
+		dialog.Info("hellogrok", "保存日志自动清理天数失败：\n"+err.Error())
+		return
+	}
+	st.retentionDays = days
+	logf("log retention preference changed: keep_usage_days=%d (applies on next application start)", days)
+}
+
+func handleSearch(st *winState) {
+	query := strings.TrimSpace(windowText(st.searchEdit))
+	if query == "" {
+		pSetFocus.Call(st.searchEdit)
+		return
+	}
+	text := windowText(st.editLg)
+	if query != st.searchQuery {
+		st.searchQuery = query
+		st.searchAfter = 0
+	}
+	start, end, ok := nextMatch(text, query, st.searchAfter)
+	if !ok {
+		resetSearch(st)
+		dialog.Info("hellogrok 日志搜索", "未找到："+query)
+		return
+	}
+	st.searchAfter = end
+	st.searchActive = true
+	st.searchSelStart = utf16Length(text[:start])
+	st.searchSelEnd = utf16Length(text[:end])
+	pSendMessageW.Call(st.editLg, wmSetSel, st.searchSelStart, st.searchSelEnd)
+	pSendMessageW.Call(st.editLg, emScrollCaret, 0, 0)
+	pSetFocus.Call(st.editLg)
+}
+
+func resetSearch(st *winState) {
+	st.searchQuery = ""
+	st.searchAfter = 0
+	st.searchActive = false
+	st.searchSelStart = 0
+	st.searchSelEnd = 0
+}
+
+func windowText(hwnd uintptr) string {
+	if hwnd == 0 {
+		return ""
+	}
+	length, _, _ := pSendMessageW.Call(hwnd, wmGetTextLength, 0, 0)
+	if length == 0 {
+		return ""
+	}
+	buffer := make([]uint16, int(length)+1)
+	pSendMessageW.Call(hwnd, wmGetText, uintptr(len(buffer)), uintptr(unsafe.Pointer(&buffer[0])))
+	return syscall.UTF16ToString(buffer)
+}
+
+func utf16Length(value string) uintptr {
+	length := 0
+	for _, r := range value {
+		length++
+		if r > 0xffff {
+			length++
+		}
+	}
+	return uintptr(length)
 }
 
 func setEditText(edit uintptr, text string) {
@@ -575,6 +891,7 @@ func loadGeometry() (x, y, w, h int) {
 	if json.Unmarshal(b, &g) != nil {
 		return
 	}
+	g = migrateLegacyWindowSize(g)
 	if g.W >= 400 && g.H >= 300 {
 		w, h = g.W, g.H
 	}
@@ -585,6 +902,13 @@ func loadGeometry() (x, y, w, h int) {
 		x, y = g.X, g.Y
 	}
 	return
+}
+
+func migrateLegacyWindowSize(g geometryJSON) geometryJSON {
+	if g.W == legacyDefaultWinW && g.H == legacyDefaultWinH {
+		g.W, g.H = defaultWinW, defaultWinH
+	}
+	return g
 }
 
 func saveGeometry(hwnd uintptr) {

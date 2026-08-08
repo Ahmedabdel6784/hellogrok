@@ -19,9 +19,9 @@ type facadeRequest struct {
 	BuildHostedWebSearch int
 	BuildXSearch         int
 	ProxyAddedWebSearch  bool
-	ClientSearchForced   bool
 	ClientSearchPrepared bool
 	ClientSearchAlias    string
+	ReplayScope          string
 }
 
 func channelFromPath(escapedPath string) (string, bool) {
@@ -78,11 +78,11 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 		return facadeRequest{}, fmt.Errorf("decode Responses request: %w", err)
 	}
 	stream, _ := root["stream"].(bool)
+	replayScope := replayConversationFingerprint(root["input"])
 	_, _, buildHostedSearch, _, buildXSearch := summarizeBody(body)
 	root["model"] = route.WireModel
 	clientSearchPrepared := prepareClientSearchExecution(root, buildHostedSearch, buildXSearch)
 	proxyAddedSearch := false
-	clientSearchForced := false
 	clientSearchAlias := ""
 	capabilities := hostedSearchCapabilities{}
 	if clientSearchPrepared {
@@ -94,7 +94,7 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 		capabilities = routeHostedSearchCapabilities(route)
 		proxyAddedSearch = ensureHostedSearch(root, capabilities)
 	} else {
-		clientSearchForced = prepareClientWebSearch(root)
+		describeClientWebTools(root)
 		clientSearchAlias = chooseClientWebSearchWireAlias(root)
 	}
 	normalizeHostedSearchObject(root, capabilities)
@@ -107,9 +107,9 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 		BuildHostedWebSearch: buildHostedSearch,
 		BuildXSearch:         buildXSearch,
 		ProxyAddedWebSearch:  proxyAddedSearch,
-		ClientSearchForced:   clientSearchForced,
 		ClientSearchPrepared: clientSearchPrepared,
 		ClientSearchAlias:    clientSearchAlias,
+		ReplayScope:          replayScope,
 	}
 
 	switch strings.ToLower(strings.TrimSpace(route.APIBackend)) {
@@ -126,7 +126,6 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 		requestInfo.Protocol = wireResponses
 		return requestInfo, nil
 	case "messages":
-		root["stream"] = false
 		converted, err := responsesToMessagesRequest(root, route.ChannelID, replays)
 		if err != nil {
 			return facadeRequest{}, err
@@ -139,7 +138,6 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 		requestInfo.Protocol = wireMessages
 		return requestInfo, err
 	case "chat_completions", "":
-		root["stream"] = false
 		converted, err := responsesToChatRequest(root, route)
 		if err != nil {
 			return facadeRequest{}, err
@@ -162,15 +160,13 @@ const clientWebFetchDescription = "Fetch and read one specific URL that is alrea
 
 const clientSearchExecutionInstructions = "Execute the hosted web_search for the supplied query. Use no more than four search calls, then always return a concise final text synthesis. Include the relevant source titles and URLs in that final text. Never finish with only reasoning or tool-call items."
 
-// prepareClientWebSearch makes Build's two client-side web tools unambiguous
-// to third-party models. Build only configures who executes web_search after a
-// function call; it does not force the conversation model to choose that call.
-func prepareClientWebSearch(root map[string]any) bool {
-	if root == nil || toolChoiceDisablesTools(root["tool_choice"]) {
-		return false
+// describeClientWebTools makes Build's two client-side web tools unambiguous
+// to third-party models. The caller's structured tool choice remains the only
+// source of mandatory selection; otherwise the conversation model decides.
+func describeClientWebTools(root map[string]any) {
+	if root == nil {
+		return
 	}
-	hasWebSearch := false
-	hasSubagentTool := false
 	for _, raw := range anySlice(root["tools"]) {
 		tool, _ := raw.(map[string]any)
 		if tool == nil || stringValue(tool["type"]) != "function" {
@@ -179,24 +175,11 @@ func prepareClientWebSearch(root map[string]any) bool {
 		name := strings.ToLower(strings.TrimSpace(functionToolName(tool)))
 		switch name {
 		case "web_search":
-			hasWebSearch = true
 			setFunctionToolDescription(tool, clientWebSearchDescription)
 		case "web_fetch":
 			setFunctionToolDescription(tool, clientWebFetchDescription)
 		}
-		if name == "spawn_subagent" || name == "task" {
-			hasSubagentTool = true
-		}
 	}
-	userText := lastUserText(root["input"])
-	if !hasWebSearch || !clientWebSearchChoiceAllows(root["tool_choice"]) ||
-		!latestInputIsUserMessage(root["input"]) ||
-		!userRequestsWebSearch(userText) ||
-		(hasSubagentTool && userRequestsSubagentDelegation(userText)) {
-		return false
-	}
-	root["tool_choice"] = map[string]any{"type": "function", "name": "web_search"}
-	return true
 }
 
 // prepareClientSearchExecution recognizes the small, non-streaming hosted
@@ -282,26 +265,6 @@ func automaticToolChoice(choice any) bool {
 	return mode == "" || mode == "auto" || mode == "required"
 }
 
-// An allowed_tools choice remains automatic only within its explicit
-// allowlist. Do not replace it with web_search when the caller excluded that
-// function.
-func clientWebSearchChoiceAllows(choice any) bool {
-	if !automaticToolChoice(choice) {
-		return false
-	}
-	value, ok := choice.(map[string]any)
-	if !ok || strings.ToLower(strings.TrimSpace(stringValue(value["type"]))) != "allowed_tools" {
-		return true
-	}
-	for _, raw := range anySlice(value["tools"]) {
-		tool, _ := raw.(map[string]any)
-		if strings.EqualFold(strings.TrimSpace(functionToolName(tool)), "web_search") {
-			return true
-		}
-	}
-	return false
-}
-
 func allowedToolNames(choice any) (map[string]struct{}, string, bool) {
 	value, ok := choice.(map[string]any)
 	if !ok || !strings.EqualFold(strings.TrimSpace(stringValue(value["type"])), "allowed_tools") {
@@ -353,95 +316,7 @@ func toolChoiceAllowsHostedSearch(choice any) bool {
 	return webSearch || xSearch
 }
 
-// Search is forced only on a new user turn. After Build returns the client
-// web_search result, the newest item is function_call_output; leaving that
-// follow-up on auto prevents a forced-search loop.
-func latestInputIsUserMessage(input any) bool {
-	if text, ok := input.(string); ok {
-		return strings.TrimSpace(text) != ""
-	}
-	items := anySlice(input)
-	for i := len(items) - 1; i >= 0; i-- {
-		item, _ := items[i].(map[string]any)
-		if item == nil {
-			continue
-		}
-		role := strings.ToLower(strings.TrimSpace(stringValue(item["role"])))
-		if role != "" {
-			return role == "user"
-		}
-		switch strings.ToLower(strings.TrimSpace(stringValue(item["type"]))) {
-		case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "web_search_call":
-			return false
-		}
-	}
-	return false
-}
-
-func userRequestsWebSearch(text string) bool {
-	text = strings.ToLower(strings.TrimSpace(text))
-	if text == "" {
-		return false
-	}
-	for _, denial := range []string{
-		"do not use web_search", "do not use the web_search", "don't use web_search", "don't use the web_search",
-		"do not call web_search", "do not call the web_search", "don't call web_search", "don't call the web_search",
-		"do not invoke web_search", "do not invoke the web_search", "do not run web_search", "do not run the web_search",
-		"never use web_search", "never call web_search", "avoid web_search", "without web_search",
-		"do not search the web", "don't search the web", "do not browse the web", "don't browse the web",
-		"do not browse online", "don't browse online", "without searching the web", "no web search", "offline only",
-		"不要使用 web_search", "不要使用web_search", "不要调用 web_search", "不要调用web_search",
-		"不用 web_search", "不用web_search", "禁止使用 web_search", "禁止使用web_search",
-		"禁止调用 web_search", "禁止调用web_search",
-		"不要联网", "无需联网", "禁止联网", "别联网", "不要上网", "不要网络搜索", "不要网页搜索", "离线回答",
-	} {
-		if strings.Contains(text, denial) {
-			return false
-		}
-	}
-	for _, marker := range []string{
-		"use web_search", "use the web_search", "call web_search", "call the web_search",
-		"invoke web_search", "invoke the web_search", "run web_search", "run the web_search",
-		"try web_search", "try the web_search", "test web_search", "test the web_search",
-		"with web_search", "via web_search", "using web_search",
-		"web search", "search the web", "search web", "browse the web", "browse online", "look up online", "online search", "internet search",
-		"使用 web_search", "使用web_search", "调用 web_search", "调用web_search", "通过 web_search", "通过web_search",
-		"联网搜索", "联网查询", "上网搜索", "上网查询", "网络搜索", "网页搜索",
-	} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	for _, freshness := range []string{
-		"latest release", "latest version", "latest news", "recent news", "current price", "current weather",
-		"最新发布", "最新版本", "最新消息", "最新新闻", "近期新闻", "当前价格", "当前天气",
-	} {
-		if strings.Contains(text, freshness) {
-			return true
-		}
-	}
-	return false
-}
-
-func userRequestsSubagentDelegation(text string) bool {
-	text = strings.ToLower(strings.TrimSpace(text))
-	for _, marker := range []string{
-		"spawn_subagent", "spawn subagent", "spawn a subagent", "spawn a sub-agent",
-		"use a subagent", "use a sub-agent", "ask a subagent", "ask the subagent",
-		"delegate to a subagent", "delegate to the subagent", "child agent",
-		"子代理", "子智能体", "委派给子", "让子代理", "由子代理",
-	} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 func routeHostedSearchCapabilities(route config.Route) hostedSearchCapabilities {
-	if route.HostedSearchKnown {
-		return hostedSearchCapabilities{Web: route.HostedWebSearch, X: route.HostedXSearch}
-	}
 	return hostedSearchCapabilities{
 		Web: true,
 		X:   strings.EqualFold(strings.TrimSpace(route.APIBackend), "responses") && isGrokRoute(route),
@@ -494,7 +369,7 @@ func responsesToMessagesRequest(root map[string]any, channel string, replays *se
 		"model":      stringValue(root["model"]),
 		"messages":   messages,
 		"max_tokens": positiveInt(root["max_output_tokens"], 8192),
-		"stream":     false,
+		"stream":     root["stream"] == true,
 	}
 	if len(system) > 0 {
 		out["system"] = strings.Join(system, "\n\n")
@@ -548,7 +423,12 @@ func responsesToChatRequest(root map[string]any, route config.Route) (map[string
 	out := map[string]any{
 		"model":    stringValue(root["model"]),
 		"messages": messages,
-		"stream":   false,
+		"stream":   root["stream"] == true,
+	}
+	if root["stream"] == true {
+		// OpenAI-compatible gateways report final token usage in a trailing
+		// streaming chunk only when this option is enabled.
+		out["stream_options"] = map[string]any{"include_usage": true}
 	}
 	if n := positiveInt(root["max_output_tokens"], 0); n > 0 {
 		out["max_tokens"] = n
@@ -613,7 +493,8 @@ func responsesInputToMessages(input any, anthropic bool, channel string, replays
 	if text, ok := input.(string); ok {
 		return []any{map[string]any{"role": "user", "content": text}}, nil, nil
 	}
-	for _, raw := range anySlice(input) {
+	items := anySlice(input)
+	for index, raw := range items {
 		item, _ := raw.(map[string]any)
 		if item == nil {
 			continue
@@ -682,7 +563,8 @@ func responsesInputToMessages(input any, anthropic bool, channel string, replays
 			}
 		case "web_search_call":
 			if anthropic {
-				for _, block := range replays.messagesBlocks(channel, item) {
+				conversation := replayConversationFingerprint(items[:index])
+				for _, block := range replays.messagesBlocks(channel, conversation, item) {
 					appendBlockToRole(&messages, "assistant", block)
 				}
 				continue
@@ -882,10 +764,6 @@ func isXAIChatRoute(route config.Route) bool {
 }
 
 func chatSearchDialect(route config.Route) config.ChatSearchDialect {
-	switch route.HostedChatSearchDialect {
-	case config.ChatSearchDialectSearchParameters, config.ChatSearchDialectWebSearchOptions:
-		return route.HostedChatSearchDialect
-	}
 	if isXAIChatRoute(route) {
 		return config.ChatSearchDialectSearchParameters
 	}
