@@ -1,43 +1,43 @@
 # Release Notes — v0.1.3
 
-## Cross-model conversation continuity
+## Conversation continuity after model switches
 
-Grok Build replays historical reasoning items after `/model` changes. Those items can contain provider-encrypted state that a different model family cannot verify or decrypt, causing deterministic request rejection and repeated retries. hellogrok now removes only complete encrypted reasoning items known to originate from a different channel, protocol, wire model, or upstream endpoint. Visible messages, tool calls, tool results, search history, and unencrypted reasoning continue unchanged.
+When you switch models with `/model` in Grok Build, historical reasoning items from the previous model may contain encrypted state that the new model cannot decrypt. This previously caused repeated request rejections and retries. hellogrok now automatically clears encrypted reasoning items that originate from a different channel, protocol, or upstream endpoint, while preserving all visible messages, tool calls, tool results, search history, and unencrypted reasoning intact.
 
-Opaque reasoning provenance is retained across proxy restarts in a bounded private index containing only SHA-256 digests. State from the same signature domain remains pass-through. Unknown state from older conversations is also passed through first; a structured signature or decryption rejection triggers exactly one replay without opaque reasoning, and a repeated rejection is marked non-retryable.
+Reasoning provenance is tracked in a bounded private index using SHA-256 digests only — no conversation content is exposed. Encrypted state from the same source continues to pass through normally. Unknown state from older conversations is also passed through on the first attempt; only a structured signature or decryption rejection triggers a single cleanup replay, and a second rejection marks it as non-retryable.
 
-## Reliable startup and channel routing
+## Faster startup and more reliable channel routing
 
-Proxy startup no longer probes every upstream for search capabilities. Omitted or false `supports_backend_search` values use Grok Build's client-search path, while an explicit true value selects hosted search without a startup request. This removes the repeated one-to-two-minute waits caused by unavailable or incompatible Grok, Claude, and GPT channels; a bad capability declaration now fails on the first real search request.
+Proxy startup no longer probes every upstream provider for search capabilities. When `supports_backend_search` is unset or `false`, Grok Build's client-search path is used directly. An explicit `true` selects hosted search without a startup probe. This eliminates the one-to-two-minute startup delays that occurred when Grok, Claude, or GPT channels were unavailable or incompatible. Incorrect capability declarations now fail on the first real search request instead of during startup.
 
-Channel parsing now preserves dotted and dashed IDs, display names, upstream model names, URL paths, and channel-owned credentials. Legacy unquoted dotted model tables are normalized only while the proxy is active and restored byte-for-byte on stop. The official `messages` backend and historical `message` alias both route through Messages conversion. Authentication defaults to Bearer for all backends, with `auth_scheme = "x_api_key"` available for providers that require it.
+Channel identifiers now fully preserve dots and dashes in IDs, display names, upstream model names, URL paths, and channel-owned credentials. Legacy model tables are normalized only while the proxy is active and restored byte-for-byte on stop. The official `messages` backend and historical `message` alias both route through Messages conversion. All backends default to Bearer authentication; providers requiring `X-Api-Key` can set `auth_scheme = "x_api_key"`.
 
-## True streaming across every supported protocol
+## True streaming for all supported protocols
 
-Responses SSE continues to pass through frame by frame. Anthropic Messages and Chat Completions requests now retain `stream=true`, and their SSE is converted incrementally into Grok Build Responses events for reasoning, answer text, function arguments, hosted-search activity, usage, completion, and terminal errors. The first local delta is emitted before the upstream response finishes.
+Responses SSE continues to pass through frame by frame. Anthropic Messages and Chat Completions requests now preserve `stream=true`, with SSE deltas converted incrementally into Grok Build Responses events — covering reasoning, answer text, function arguments, hosted-search activity, usage statistics, completion, and terminal errors. The first local delta is emitted before the upstream response finishes.
 
-If a provider ignores `stream=true` and returns one complete JSON response, hellogrok keeps the request usable through a buffered SSE fallback and records that downgrade explicitly. A complete upstream response cannot be reconstructed into genuine token timing.
+If a provider ignores `stream=true` and returns a single complete JSON response, hellogrok keeps the request functional through a buffered SSE fallback and explicitly records the downgrade. Once the full upstream response has arrived, genuine per-token timing cannot be reconstructed.
 
-## Native search source counts for all channel protocols
+## Unified search source counts across all channels
 
-Search evidence from Responses, Messages, and Chat Completions channels is normalized into both `web_search_call.action.sources` and `output_text.annotations`. This also applies when any supported protocol is selected as Grok Build's client-search model, independently of `supports_backend_search`. Grok Build can therefore render its native deduplicated site count for both hosted and client search.
+Search evidence from Responses, Messages, and Chat Completions channels is normalized into both `web_search_call.action.sources` and `output_text.annotations`. This applies regardless of which protocol is selected as Grok Build's client-search model, independent of `supports_backend_search`. Grok Build can therefore display its native deduplicated site count for both hosted and client search.
 
-Only real HTTP(S) URLs from structured results, citations, annotations, or a final answer with independently confirmed search activity are emitted. Ordinary answer links never create a search call, and hellogrok does not invent sources or counts when a provider returns no URL evidence.
+Only real HTTP(S) URLs from structured results, citations, annotations, or answers with independently confirmed search activity are emitted. Ordinary links in answers never create a search call, and hellogrok does not fabricate sources or counts when a provider returns no URL evidence.
 
-## Response validation and retry control
+## Smarter response validation and retry control
 
-Successful upstream responses must now contain the minimum valid Responses, Messages, or Chat Completions envelope. Malformed 2xx responses return a focused 502 instead of entering Grok Build's retry loop as apparent successes. Deterministic configuration, schema, and conversion failures include `X-Should-Retry: false`; real transport failures and upstream retry hints retain their retry behavior. Successful HTML pages from an incorrect API root produce a direct `base_url`/`api_backend` diagnostic without exposing the page body.
+Successful upstream responses must now contain a valid Responses, Messages, or Chat Completions structure. Malformed 2xx responses return a clear 502 instead of entering Grok Build's retry loop as if they were legitimate successes. Deterministic failures caused by configuration, schema, or conversion issues now include `X-Should-Retry: false` to prevent pointless retries; real transport failures and upstream retry hints retain their existing behavior. HTML success pages returned from an incorrect API root produce a direct `base_url`/`api_backend` diagnostic without exposing the page body.
 
-Client-search tool use is driven only by structured `tool_choice`, not prompt keywords. Provider-only search replay is isolated by channel, prior conversation, and stable search identity, and ambiguous matches are rejected instead of combining unrelated search blocks.
+Client-search tool selection is now driven solely by structured `tool_choice`, not by scanning prompt keywords. Provider-specific search replay is isolated by channel, prior conversation, and stable search identity — ambiguous matches are rejected outright rather than merging unrelated search content.
 
-## Live Grok Build synchronization and recovery
+## Automatic session sync for open windows
 
-After proxy enable or disable, hellogrok connects to an existing Grok Build shared leader over ACP, reloads the model catalog, and reselects the current model in idle custom-model sessions. This refreshes in-memory URLs, backends, credentials, and normalized model IDs without requiring a new window. Active, input-blocked, externally replaced, and `--no-leader` sessions are handled conservatively and report when manual `/model` reselection is still required.
+After enabling or disabling the proxy, hellogrok connects to the current Grok Build shared leader over ACP, reloads the model catalog, and reselects the current model in idle custom-model sessions. This means you no longer need to open a new window after changing proxy settings — in-memory URLs, backends, credentials, and normalized model IDs refresh automatically. Sessions that are actively in use, waiting for input, externally replaced, or using `--no-leader` are handled conservatively, with a clear prompt when manual `/model` reselection is still needed.
 
-Both current and legacy ACP model-switch methods are supported. On Windows, a live named-pipe leader misreported as stale by Grok Build 1.0.0 is accepted only while its lock is actively held. Version 5 rewrite transactions remain recoverable after the state schema upgrade.
+Both current and legacy ACP model-switch methods are supported. On Windows, a live named-pipe leader incorrectly reported as stale by Grok Build 1.0.0 is accepted only while its lock is actively held. Version 5 rewrite transactions remain recoverable after the state schema upgrade.
 
-## Windows status, logs, and port handling
+## Windows: status panel, logging, and port conflicts
 
-The status panel now groups proxy, channel, Grok-session, protocol/search, and recovery information. Logs append across sessions, retain the latest seven distinct usage days by default, and support selectable retention plus wrapped next-match search. Status text wraps while raw log lines keep horizontal scrolling.
+The status panel now organizes information into proxy, channel, Grok session, protocol/search, and configuration recovery sections. Logs append across proxy sessions, retaining the latest seven distinct usage days by default, with support for custom retention periods and wrapped next-match search. Status text wraps automatically while raw log lines retain horizontal scrolling.
 
-An occupied `127.0.0.1:18787`, including WinSock error 10048, is detected before Grok configuration is changed. Asynchronous tray failures are shown directly instead of leaving the interface in an uncertain state.
+Port conflicts on `127.0.0.1:18787`, including WinSock error 10048, are detected before any changes are made to the Grok configuration. Asynchronous tray operation failures are now reported directly instead of leaving the interface in an indeterminate state.
