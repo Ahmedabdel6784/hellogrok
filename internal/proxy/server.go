@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -40,16 +41,35 @@ type Server struct {
 	connections     *connectionTracker
 	shutdownTimeout time.Duration
 
-	probedMu sync.Mutex
-	probed   map[string]bool
-	replays  *searchReplayCache
+	probedMu  sync.Mutex
+	probed    map[string]bool
+	replays   *searchReplayCache
+	reasoning *reasoningProvenanceStore
 }
 
 const maxSSEEventBytes = 16 << 20
 
 func New(logger *log.Logger) *Server {
+	return newServer(logger, "")
+}
+
+// NewPersistent uses dataDir for privacy-preserving reasoning provenance so
+// model hot switching remains reliable across process restarts.
+func NewPersistent(logger *log.Logger, dataDir string) *Server {
+	dataDir = strings.TrimSpace(dataDir)
+	if dataDir == "" {
+		return newServer(logger, "")
+	}
+	return newServer(logger, filepath.Join(dataDir, reasoningProvenanceFileName))
+}
+
+func newServer(logger *log.Logger, reasoningPath string) *Server {
 	if logger == nil {
 		logger = log.Default()
+	}
+	reasoning, reasoningErr := newReasoningProvenanceStore(reasoningPath)
+	if reasoningErr != nil {
+		logger.Printf("reasoning provenance load warning: %v", reasoningErr)
 	}
 	connections := newConnectionTracker()
 	transport := newUpstreamTransport(connections)
@@ -71,6 +91,7 @@ func New(logger *log.Logger) *Server {
 		requestCancel:   requestCancel,
 		probed:          map[string]bool{},
 		replays:         newSearchReplayCache(),
+		reasoning:       reasoning,
 	}
 }
 
@@ -177,6 +198,9 @@ func (s *Server) Stop() {
 	}
 	s.transport.CloseIdleConnections()
 	s.wg.Wait()
+	if err := s.reasoning.flush(); err != nil {
+		s.log.Printf("reasoning provenance flush failed: %v", err)
+	}
 	if s.pathServer == server {
 		s.pathServer = nil
 	}
@@ -356,7 +380,8 @@ func (s *Server) probeOnce(channel string, sample []byte, isSSELine bool) {
 	s.log.Printf("schema probe channel=%s: filled %s", channel, strings.Join(missing, "; "))
 }
 
-func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Response, channel string, request facadeRequest, options patch.Options, started time.Time) {
+func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Response, route config.Route, request facadeRequest, options patch.Options, started time.Time) {
+	channel := route.ChannelID
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSONError(w, http.StatusInternalServerError, "stream unsupported")
@@ -454,6 +479,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		if err != nil {
 			return fmt.Errorf("invalid upstream Responses SSE data: %w", err)
 		}
+		s.captureReasoningProvenance(route, event)
 		streamedURLs = mergeUniqueStrings(streamedURLs, urlsFromJSON(event)...)
 		switch stringValue(event["type"]) {
 		case "response.output_text.delta":

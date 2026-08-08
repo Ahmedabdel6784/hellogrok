@@ -622,7 +622,11 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 		if strings.TrimSpace(string(payload)) != "[DONE]" {
 			evidence.observeJSON(payload)
 		}
-		return state.handle(payload)
+		err := state.handle(payload)
+		if err == nil {
+			s.captureReasoningProvenance(route, state.output)
+		}
+		return err
 	})
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, streamErr)
@@ -977,7 +981,11 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 		if strings.TrimSpace(string(payload)) != "[DONE]" {
 			evidence.observeJSON(payload)
 		}
-		return state.handle(payload)
+		err := state.handle(payload)
+		if err == nil {
+			s.captureReasoningProvenance(route, state.output)
+		}
+		return err
 	})
 	if streamErr == nil && !state.terminal && state.finishReason != "" {
 		streamErr = state.finish()

@@ -28,7 +28,17 @@ secrets*.json
 /.hellogrok/
 /config.toml
 /config_rewrite_state.json
+/reasoning_provenance.json
+/last_request.json
+/last_request_meta.json
+/last_request_meta.txt
 /settings.json
+/window.json
+/instance.lock
+/channel-smoke/
+/hot-switch-smoke/
+/hot-switch-restart/
+/.hellogrok-*
 
 # local only — committed syso under cmd/hellogrok are OK for PE icons
 # *.syso

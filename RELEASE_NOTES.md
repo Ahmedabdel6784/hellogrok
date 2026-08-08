@@ -1,4 +1,10 @@
-# Release Notes — v0.1.2
+# Release Notes — v0.1.3
+
+## Cross-model conversation continuity
+
+Grok Build replays historical reasoning items after `/model` changes. Those items can contain provider-encrypted state that a different model family cannot verify or decrypt, causing deterministic request rejection and repeated retries. hellogrok now removes only complete encrypted reasoning items known to originate from a different channel, protocol, wire model, or upstream endpoint. Visible messages, tool calls, tool results, search history, and unencrypted reasoning continue unchanged.
+
+Opaque reasoning provenance is retained across proxy restarts in a bounded private index containing only SHA-256 digests. State from the same signature domain remains pass-through. Unknown state from older conversations is also passed through first; a structured signature or decryption rejection triggers exactly one replay without opaque reasoning, and a repeated rejection is marked non-retryable.
 
 ## Reliable startup and channel routing
 

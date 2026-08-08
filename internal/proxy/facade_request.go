@@ -22,6 +22,8 @@ type facadeRequest struct {
 	ClientSearchPrepared bool
 	ClientSearchAlias    string
 	ReplayScope          string
+	Reasoning            reasoningFilterStats
+	ReasoningRecovery    bool
 }
 
 func channelFromPath(escapedPath string) (string, bool) {
@@ -73,6 +75,16 @@ func upstreamTarget(route config.Route, rawQuery string) (string, wireProtocol, 
 }
 
 func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCache) (facadeRequest, error) {
+	return adaptFacadeRequestWithReasoning(body, route, replays, nil, keepUnknownReasoning)
+}
+
+func adaptFacadeRequestWithReasoning(
+	body []byte,
+	route config.Route,
+	replays *searchReplayCache,
+	provenance *reasoningProvenanceStore,
+	filterMode reasoningFilterMode,
+) (facadeRequest, error) {
 	root, err := decodeRequestObject(body)
 	if err != nil {
 		return facadeRequest{}, fmt.Errorf("decode Responses request: %w", err)
@@ -81,6 +93,7 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 	replayScope := replayConversationFingerprint(root["input"])
 	_, _, buildHostedSearch, _, buildXSearch := summarizeBody(body)
 	root["model"] = route.WireModel
+	reasoning := filterReasoningInput(root, route, provenance, filterMode)
 	clientSearchPrepared := prepareClientSearchExecution(root, buildHostedSearch, buildXSearch)
 	proxyAddedSearch := false
 	clientSearchAlias := ""
@@ -110,6 +123,8 @@ func adaptFacadeRequest(body []byte, route config.Route, replays *searchReplayCa
 		ClientSearchPrepared: clientSearchPrepared,
 		ClientSearchAlias:    clientSearchAlias,
 		ReplayScope:          replayScope,
+		Reasoning:            reasoning,
+		ReasoningRecovery:    filterMode == dropAllOpaqueReasoning,
 	}
 
 	switch strings.ToLower(strings.TrimSpace(route.APIBackend)) {

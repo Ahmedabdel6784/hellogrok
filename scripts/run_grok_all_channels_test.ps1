@@ -142,9 +142,15 @@ $results = foreach ($model in $Models) {
     $finished = $process.WaitForExit($TimeoutSeconds * 1000)
     if (-not $finished) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        $process.WaitForExit()
         $status = "timeout"
         $exitCode = -1
     } else {
+        # Complete redirected-stream handling and refresh the process handle before
+        # reading ExitCode. A timed WaitForExit alone can leave ExitCode unset in
+        # PowerShell even though the child has already written valid output.
+        $process.WaitForExit()
+        $process.Refresh()
         $status = if ($process.ExitCode -eq 0) { "ok" } else { "failed" }
         $exitCode = $process.ExitCode
     }

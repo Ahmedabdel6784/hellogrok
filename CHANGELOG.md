@@ -4,7 +4,9 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.2] — 2026-08-08
+## [Unreleased]
+
+## [0.1.3] — 2026-08-08
 
 ### Added
 
@@ -16,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Model hot switching now preserves ordinary conversation and tool history while removing only provider-encrypted reasoning known to originate from a different channel, protocol, wire model, or upstream endpoint. Legacy opaque state remains pass-through unless the upstream returns a structured signature or decryption rejection, which triggers exactly one clean replay and then a non-retryable error if rejection persists.
 - Unquoted dotted model tables are normalized while the proxy is active and restored byte-for-byte on stop.
 - Channel IDs, display names, and upstream model names containing dots or dashes retain channel authentication and routing.
 - Version 5 rewrite transactions remain recoverable after the state schema upgrade.
@@ -40,6 +43,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Logs append across proxy sessions instead of being truncated, and the status panel is grouped into scan-friendly sections.
 - Proxy startup no longer probes upstream search capabilities. Omitted and false `supports_backend_search` values use client search, explicit true values are trusted, and an explicitly selected search model is routed without startup validation.
 - Upstream authentication now defaults to Bearer for every backend, matching Grok Build; Messages providers that require `X-Api-Key` must opt in with `auth_scheme = "x_api_key"`.
+
+### Security
+
+- Opaque reasoning provenance survives proxy restarts in a bounded private index containing only SHA-256 digests; raw reasoning signatures, channel IDs, model names, upstream URLs, and credentials are never persisted.
 
 ## [0.1.1] — 2026-08-07
 
@@ -78,6 +85,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[0.1.2]: https://github.com/hellowind777/hellogrok/compare/v0.1.1...v0.1.2
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/hellowind777/hellogrok/compare/v0.1.1...v0.1.3
 [0.1.1]: https://github.com/hellowind777/hellogrok/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/hellowind777/hellogrok/releases/tag/v0.1.0

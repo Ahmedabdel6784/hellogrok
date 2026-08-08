@@ -6,13 +6,13 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.2-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.3-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
 [![LINUX DO](https://img.shields.io/badge/LINUX_DO-recognized-0A84FF?logo=linux&logoColor=white)](https://linux.do)
 
-[English](./README.md) · [简体中文](./README_CN.md) · [Changelog](./CHANGELOG.md)
+[English](./README.md) · [简体中文](./README_CN.md) · [Release notes](./RELEASE_NOTES.md) · [Changelog](./CHANGELOG.md)
 
 > 🏅 This project is linked & recognized by the [LINUX DO](https://linux.do) community.
 
@@ -21,6 +21,7 @@ A cross-platform local proxy that makes Grok Build custom model channels work wi
 - [Why hellogrok](#why-hellogrok)
 - [Features](#features)
 - [Search and configuration](#search-and-configuration)
+- [Download](#download)
 - [Quick start](#quick-start)
 - [Platform support](#platform-support)
 - [Tray and CLI](#tray-and-cli)
@@ -51,6 +52,7 @@ It is intended for users who maintain multiple third-party model channels and wa
 - Passes through Responses SSE and incrementally translates Messages and Chat Completions SSE, including reasoning, text, function arguments, hosted-search activity, and terminal errors.
 - Preserves each configured upstream URL path and model identifier.
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
+- Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
 
 ### Native Web tools
 
@@ -136,6 +138,27 @@ Quote the full ID when a channel ID contains a dot, for example `[model."provide
 
 Do not manually set a custom channel URL to hellogrok's local address. The application manages temporary local URLs only while the proxy is active.
 
+## Download
+
+Download the latest tagged build from [GitHub Releases](https://github.com/hellowind777/hellogrok/releases/latest). Windows releases provide separate tray and console executables; Linux and macOS releases provide the standard foreground CLI.
+
+| Platform | Release assets |
+|----------|----------------|
+| Windows amd64 / arm64 | `hellogrok-windows-<arch>.exe` and `hellogrok-cli-windows-<arch>.exe` |
+| Linux amd64 / arm64 | `hellogrok-linux-<arch>` |
+| macOS Intel / Apple Silicon | `hellogrok-darwin-<arch>` |
+
+Every binary has a neighboring `.sha256` file. On Windows, verify an amd64 tray build before running it:
+
+```powershell
+$artifact = ".\hellogrok-windows-amd64.exe"
+$expected = ((Get-Content -LiteralPath "${artifact}.sha256") -split '\s+')[0]
+$actual = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+$actual -eq $expected
+```
+
+The final command must print `True`. On Linux use `sha256sum -c <file>.sha256`; on macOS use `shasum -a 256 -c <file>.sha256`. Release binaries are currently unsigned, so checksum verification establishes file integrity but not publisher identity.
+
 ## Quick start
 
 ### Prerequisites
@@ -177,7 +200,7 @@ Expected startup output includes a local channel endpoint and a successful confi
 
 1. Run `hellogrok routes` and confirm every intended custom model is listed with the correct backend and an available authentication source.
 2. Start hellogrok. If Grok Build is already open, inspect the shared-leader hot-switch result in status or logs.
-3. Switch models with `/model` and test a normal conversation.
+3. Start with a unique, non-sensitive detail, switch through the intended models with `/model`, and confirm a later model can refer to the visible conversation history.
 4. Test `web_search` and `web_fetch` separately according to the selected search mode.
 5. Stop hellogrok normally and confirm Grok Build's configuration no longer points to the local proxy.
 
@@ -251,7 +274,7 @@ If both Grok proxies were enabled accidentally, disable CC Switch's Grok Build t
 | Windows | `%LOCALAPPDATA%\hellogrok` |
 | Linux and macOS | `~/.hellogrok` |
 
-Runtime data contains application preferences, logs, and the recovery state used to restore managed configuration.
+Runtime data contains application preferences, logs, the recovery state used to restore managed configuration, and `reasoning_provenance.json`. The provenance index stores only SHA-256 digests of opaque reasoning values and route signature domains; it never stores raw reasoning, channel IDs, model names, upstream URLs, or credentials.
 
 Log retention is applied on every platform. The native retention selector and in-window search are currently Windows-only because the standard Linux and macOS builds use terminal log viewing instead of the Win32 status window.
 
@@ -330,6 +353,10 @@ Use `api_backend = "messages"` (plural). Grok Build's current source defines onl
 
 Check the **Grok session hot switch** line in **Status and logs**. Automatic switching applies to idle custom-model sessions on a shared leader and supports both current and legacy ACP model-switch method names. On Windows, a live named-pipe leader misreported as stale by Grok Build 1.0.0 is accepted only when its leader lock is actively held. A working or input-blocked session is skipped safely; reselect its current model in `/model` after the active operation finishes. A window started with `--no-leader` exposes no external IPC to hellogrok and also requires manual reselection or a new window.
 
+### A model switch asks to start a new conversation
+
+Grok Build replays all historical reasoning items, including provider-encrypted state, after `/model` changes. hellogrok records the emitting signature domain and removes only known foreign encrypted reasoning from the target request; normal messages, tool calls, tool results, search history, and unencrypted reasoning remain unchanged. For an older conversation whose opaque state predates the local provenance index, hellogrok first preserves the request and performs one clean replay only if the upstream returns a structured signature or decryption rejection. A repeated deterministic rejection is marked non-retryable instead of entering Grok Build's generic retry loop.
+
 ### The configuration still points to localhost after a forced exit
 
 Ensure no hellogrok process is running, then execute `hellogrok restore`. Do not run `restore` against an active proxy.
@@ -372,6 +399,7 @@ CI runs tests and default builds on Windows, Linux, Intel macOS, and Apple Silic
 - hellogrok cannot create provider-side search capability. A hosted-search channel must actually support search and return its results.
 - A relay that removes tool declarations, tool calls, citations, or result events cannot be fully repaired downstream.
 - A provider that ignores `stream=true` cannot be made truly streaming after its complete JSON response has already arrived; hellogrok logs and uses a buffered compatibility fallback.
+- Provider-encrypted hidden reasoning is scoped to its emitting signature domain. Cross-domain switching preserves visible conversation and tool history but intentionally omits incompatible private reasoning.
 - Provider-specific API extensions outside the supported Responses, Chat Completions, and Messages formats may require additional adaptation.
 - Upstream availability, model access, account pools, rate limits, and gateway errors remain the provider's responsibility.
 - Optional Unix tray behavior depends on the installed desktop environment; the standard Unix CLI is the portable path.

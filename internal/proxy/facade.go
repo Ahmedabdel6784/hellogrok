@@ -24,6 +24,7 @@ const maxFacadeBodyBytes int64 = 64 << 20
 var errBodyTooLarge = errors.New("body exceeds size limit")
 
 func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, route config.Route) {
+	defer s.flushReasoningProvenance()
 	if incoming.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "custom channel facade accepts POST only")
 		return
@@ -51,7 +52,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		writeJSONError(w, http.StatusBadRequest, "read request: "+err.Error())
 		return
 	}
-	request, err := adaptFacadeRequest(body, route, s.replays)
+	request, err := adaptFacadeRequestWithReasoning(body, route, s.replays, s.reasoning, keepUnknownReasoning)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -71,6 +72,11 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	s.log.Printf("UP channel=%s backend=%s %s body=%dB model=%s tools=%d web_search=%d hosted_web_search=%d function_web_search=%d x_search=%d build_hosted_web_search=%d build_x_search=%d proxy_added_web_search=%t client_web_search_prepared=%t client_web_search_aliased=%t",
 		route.ChannelID, route.APIBackend, logTarget, len(request.Body), route.WireModel, tools, webSearch, hostedSearch, functionSearch, xSearch,
 		request.BuildHostedWebSearch, request.BuildXSearch, request.ProxyAddedWebSearch, request.ClientSearchPrepared, request.ClientSearchAlias != "")
+	if request.Reasoning.Opaque > 0 {
+		s.log.Printf("UP channel=%s reasoning projection opaque=%d compatible=%d unknown=%d dropped=%d recovery=%t",
+			route.ChannelID, request.Reasoning.Opaque, request.Reasoning.Compatible,
+			request.Reasoning.Unknown, request.Reasoning.Dropped, request.ReasoningRecovery)
+	}
 	saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
 	if incomingModel := extractModel(body); incomingModel != "" && incomingModel != route.WireModel {
 		s.log.Printf("UP model isolated channel=%s: %s -> %s", route.ChannelID, incomingModel, route.WireModel)
@@ -117,26 +123,32 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 		return s.client.Do(req)
 	}
 
-	resp, err := doRequest(request.Body)
-	if err != nil {
-		detail := safeUpstreamError(err)
-		s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
-		writeRetryableJSONError(w, http.StatusBadGateway, "upstream: "+detail)
-		return
-	}
-	defer resp.Body.Close()
-	s.log.Printf("UP channel=%s status=%d ct=%s %s", route.ChannelID, resp.StatusCode, resp.Header.Get("Content-Type"), time.Since(started).Round(time.Millisecond))
-	if encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		writeJSONError(w, http.StatusBadGateway, "upstream returned unsupported content encoding "+encoding)
-		return
-	}
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+	var resp *http.Response
+	for {
+		resp, err = doRequest(request.Body)
+		if err != nil {
+			detail := safeUpstreamError(err)
+			s.log.Printf("UP channel=%s request failed: %s", route.ChannelID, detail)
+			writeRetryableJSONError(w, http.StatusBadGateway, "upstream: "+detail)
+			return
+		}
+		s.log.Printf("UP channel=%s status=%d ct=%s %s", route.ChannelID, resp.StatusCode, resp.Header.Get("Content-Type"), time.Since(started).Round(time.Millisecond))
+		if encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
+			_ = resp.Body.Close()
+			writeJSONError(w, http.StatusBadGateway, "upstream returned unsupported content encoding "+encoding)
+			return
+		}
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			break
+		}
 		if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest {
+			_ = resp.Body.Close()
 			writeJSONError(w, http.StatusBadGateway, "upstream redirects are not accepted")
 			return
 		}
+
 		data, readErr := readBodyLimited(resp.Body, maxFacadeBodyBytes)
+		_ = resp.Body.Close()
 		if readErr != nil {
 			if errors.Is(readErr, errBodyTooLarge) {
 				writeJSONError(w, http.StatusBadGateway, "upstream error body exceeds 64 MiB")
@@ -145,11 +157,32 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			}
 			return
 		}
+
+		reasoningRejected := isOpaqueReasoningRejection(resp.StatusCode, data)
+		keptOpaqueReasoning := request.Reasoning.Opaque - request.Reasoning.Dropped
+		if reasoningRejected && keptOpaqueReasoning > 0 && !request.ReasoningRecovery {
+			retryRequest, retryErr := adaptFacadeRequestWithReasoning(body, route, s.replays, s.reasoning, dropAllOpaqueReasoning)
+			if retryErr == nil && retryRequest.Reasoning.Dropped > request.Reasoning.Dropped {
+				s.log.Printf("UP channel=%s reasoning recovery retry once removed=%d after status=%d",
+					route.ChannelID, retryRequest.Reasoning.Dropped, resp.StatusCode)
+				request = retryRequest
+				saveLastRequestMeta(logTarget, route.WireModel, len(request.Body), tools, webSearch, hostedSearch, functionSearch, xSearch, request)
+				continue
+			}
+			if retryErr != nil {
+				s.log.Printf("UP channel=%s reasoning recovery request failed: %v", route.ChannelID, retryErr)
+			}
+		}
+
 		copySafeResponseHeaders(w.Header(), resp.Header)
+		if reasoningRejected {
+			w.Header().Set("X-Should-Retry", "false")
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(data)
 		return
 	}
+	defer resp.Body.Close()
 
 	options := patch.Options{GPTResponses: true, WebSearch: true, RequestModel: route.WireModel}
 	upstreamSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
@@ -160,7 +193,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	if upstreamSSE {
 		switch request.Protocol {
 		case wireResponses:
-			s.streamResponsesSSE(w, resp, route.ChannelID, request, options, started)
+			s.streamResponsesSSE(w, resp, route, request, options, started)
 		case wireMessages:
 			s.streamMessagesSSE(w, resp, route, request, started)
 		case wireChatCompletions:
@@ -205,6 +238,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 			writeJSONError(w, http.StatusBadGateway, "invalid upstream Responses body: "+validateErr.Error())
 			return
 		}
+		s.captureReasoningProvenance(route, canonical)
 		data, readErr = json.Marshal(canonical)
 		if readErr != nil {
 			writeJSONError(w, http.StatusBadGateway, "encode upstream Responses body: "+readErr.Error())
@@ -261,6 +295,7 @@ func (s *Server) forwardFacade(w http.ResponseWriter, incoming *http.Request, ro
 	canonical := canonicalResponse(route, request, result)
 	restoreClientWebSearchAlias(canonical, request.ClientSearchAlias)
 	backfillResponseSearchSources(canonical, request.HostedWebSearch, request.SearchQuery)
+	s.captureReasoningProvenance(route, canonical)
 	if request.Stream {
 		s.log.Printf("UP channel=%s backend=%s ignored stream=true; emitting buffered JSON fallback", route.ChannelID, route.APIBackend)
 	}

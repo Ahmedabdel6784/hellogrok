@@ -6,13 +6,13 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.2-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.3-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
 [![LINUX DO](https://img.shields.io/badge/LINUX_DO-链接认可-0A84FF?logo=linux&logoColor=white)](https://linux.do)
 
-[English](./README.md) · [简体中文](./README_CN.md) · [Changelog](./CHANGELOG.md)
+[English](./README.md) · [简体中文](./README_CN.md) · [发布说明](./RELEASE_NOTES_CN.md) · [更新日志](./CHANGELOG.md)
 
 > 🏅 此项目已链接认可 [LINUX DO](https://linux.do) 社区。
 
@@ -21,6 +21,7 @@
 - [为什么需要 hellogrok](#为什么需要-hellogrok)
 - [功能](#功能)
 - [搜索与配置](#搜索与配置)
+- [下载](#下载)
 - [快速开始](#快速开始)
 - [平台支持](#平台支持)
 - [托盘与 CLI](#托盘与-cli)
@@ -51,6 +52,7 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 - 逐帧透传 Responses SSE，并逐帧转换 Messages 与 Chat Completions SSE，包括推理、正文、函数参数、hosted 搜索活动和终止错误。
 - 保留每个渠道配置的上游 URL 路径和模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
+- 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
 
 ### 原生 Web 工具
 
@@ -136,6 +138,27 @@ supports_backend_search = false
 
 不要手动把自定义渠道 URL 设置成 hellogrok 的本地地址。本地临时 URL 只应由应用在代理运行期间管理。
 
+## 下载
+
+从 [GitHub Releases](https://github.com/hellowind777/hellogrok/releases/latest) 下载最新标签构建。Windows 发布包分别提供托盘程序和控制台程序；Linux 与 macOS 发布包提供标准前台 CLI。
+
+| 平台 | 发布文件 |
+|------|----------|
+| Windows amd64 / arm64 | `hellogrok-windows-<arch>.exe` 和 `hellogrok-cli-windows-<arch>.exe` |
+| Linux amd64 / arm64 | `hellogrok-linux-<arch>` |
+| macOS Intel / Apple Silicon | `hellogrok-darwin-<arch>` |
+
+每个二进制文件旁都有对应的 `.sha256` 文件。在 Windows 上，运行 amd64 托盘程序前可执行：
+
+```powershell
+$artifact = ".\hellogrok-windows-amd64.exe"
+$expected = ((Get-Content -LiteralPath "${artifact}.sha256") -split '\s+')[0]
+$actual = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+$actual -eq $expected
+```
+
+最后一条命令必须输出 `True`。Linux 使用 `sha256sum -c <file>.sha256`，macOS 使用 `shasum -a 256 -c <file>.sha256`。当前发布二进制尚未签名，校验和能够证明文件完整性，但不能代替发布者身份签名。
+
 ## 快速开始
 
 ### 前置条件
@@ -177,7 +200,7 @@ CGO_ENABLED=0 go build -trimpath -o dist/hellogrok ./cmd/hellogrok
 
 1. 执行 `hellogrok routes`，确认需要使用的自定义模型均已列出，后端和鉴权来源正确。
 2. 启动 hellogrok；若 Grok Build 已打开，查看状态或日志中的共享 leader 热切换结果。
-3. 使用 `/model` 切换模型并测试普通对话。
+3. 先在对话中写入一条不敏感的唯一信息，再通过 `/model` 切换计划使用的模型，并确认后续模型仍能引用可见会话历史。
 4. 根据当前搜索模式分别测试 `web_search` 和 `web_fetch`。
 5. 正常停止 hellogrok，确认 Grok Build 配置不再指向本地代理。
 
@@ -251,7 +274,7 @@ Windows 的“状态与日志”分割工具条提供自动清理天数选择和
 | Windows | `%LOCALAPPDATA%\hellogrok` |
 | Linux 和 macOS | `~/.hellogrok` |
 
-运行数据包括应用偏好、日志以及用于恢复代理管理配置的恢复状态。
+运行数据包括应用偏好、日志、用于恢复代理管理配置的恢复状态，以及 `reasoning_provenance.json`。推理来源索引只保存不透明推理值和路由签名域的 SHA-256 摘要，不保存原始推理、渠道 ID、模型名、上游 URL 或凭据。
 
 日志保留规则在所有平台生效。原生下拉框和窗口内搜索目前仅适用于 Windows，因为标准 Linux 与 macOS 构建使用终端日志视图，没有对应的 Win32 状态窗口。
 
@@ -330,6 +353,10 @@ Configured custom API channel
 
 查看“状态与日志”中的“Grok 会话热切换”。自动热切换只适用于共享 leader 中的空闲自定义模型会话，并兼容新旧 ACP 模型切换方法。Windows 上若 Grok Build 1.0.0 把活动的命名管道 leader 误报为 stale，hellogrok 只会在其 leader 锁确实被占用时接管。正在生成或等待输入的会话会被安全跳过；完成当前操作后在 `/model` 中重新选择当前模型。使用 `--no-leader` 打开的窗口没有可供 hellogrok 连接的外部 IPC，也需要手动重选或新开窗口。
 
+### 切换模型后提示必须新建会话
+
+Grok Build 在 `/model` 切换后会重放全部历史推理项，其中可能包含服务商加密状态。hellogrok 会记录其来源签名域，并仅从目标请求中删除已知异域的加密推理；普通消息、工具调用、工具结果、搜索历史和未加密推理均保持不变。对于早于本地来源索引的旧会话不透明状态，hellogrok 首次仍保持透传，只有上游返回结构化签名或解密拒绝时才执行一次清理重放；若确定性拒绝再次发生，则标记为不可重试，避免进入 Grok Build 通用重试循环。
+
 ### 强制退出后配置仍指向 localhost
 
 先确认没有 hellogrok 进程正在运行，再执行 `hellogrok restore`。不要对正在运行的代理执行 `restore`。
@@ -372,6 +399,7 @@ CI 会在 Windows、Linux、Intel macOS 和 Apple Silicon macOS 上运行测试�
 - hellogrok 无法创造服务商侧的搜索能力；hosted search 渠道必须真实支持搜索并返回结果。
 - 中转如果主动删除工具声明、工具调用、引用或结果事件，下游无法完整恢复。
 - 供应商若无视 `stream=true`，等完整 JSON 已经返回后无法再变成真正流式；hellogrok 会记录并使用缓冲兼容回退。
+- 服务商加密的隐藏推理只属于其来源签名域。跨域切换会保留可见会话与工具历史，但会主动排除不兼容的私有推理。
 - 超出受支持 Responses、Chat Completions 和 Messages 格式的服务商私有扩展可能需要单独适配。
 - 上游可用性、模型权限、账号池、限流和网关错误仍由服务商负责。
 - 可选 Unix 托盘依赖已安装的桌面环境；标准 Unix CLI 是更通用的使用方式。

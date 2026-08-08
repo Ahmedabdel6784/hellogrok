@@ -29,6 +29,10 @@ type requestMeta struct {
 	ProxyAddedWebSearch  bool   `json:"proxy_added_web_search"`
 	ClientSearchPrepared bool   `json:"client_web_search_prepared"`
 	ClientSearchAliased  bool   `json:"client_web_search_aliased"`
+	OpaqueReasoning      int    `json:"opaque_reasoning"`
+	ReasoningDropped     int    `json:"reasoning_dropped"`
+	ReasoningUnknown     int    `json:"reasoning_unknown"`
+	ReasoningRecovery    bool   `json:"reasoning_recovery"`
 }
 
 var requestMetaWriteMu sync.Mutex
@@ -66,6 +70,10 @@ func saveLastRequestMeta(target, model string, bodyBytes, tools, webSearch, host
 		ProxyAddedWebSearch:  request.ProxyAddedWebSearch,
 		ClientSearchPrepared: request.ClientSearchPrepared,
 		ClientSearchAliased:  request.ClientSearchAlias != "",
+		OpaqueReasoning:      request.Reasoning.Opaque,
+		ReasoningDropped:     request.Reasoning.Dropped,
+		ReasoningUnknown:     request.Reasoning.Unknown,
+		ReasoningRecovery:    request.ReasoningRecovery,
 	})
 	if err == nil {
 		_ = writeRequestMetaAtomic(filepath.Join(dir, "last_request_meta.json"), b)

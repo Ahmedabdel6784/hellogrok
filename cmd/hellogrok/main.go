@@ -122,7 +122,7 @@ func main() {
 		logFile:             lf,
 		dataDir:             dataDir,
 		logPath:             logPath,
-		server:              proxy.New(logger),
+		server:              proxy.NewPersistent(logger, dataDir),
 		refreshGrokSessions: groksync.Refresh,
 	}
 
@@ -574,7 +574,7 @@ func (a *App) resolveSearchRoutes(
 
 func (a *App) abortStart(err error) error {
 	a.server.Stop()
-	a.server = proxy.New(a.logger)
+	a.server = proxy.NewPersistent(a.logger, a.dataDir)
 	a.lastError = err.Error()
 	return err
 }
@@ -712,7 +712,7 @@ func (a *App) Stop() error {
 	}
 
 	a.server.Stop()
-	a.server = proxy.New(a.logger)
+	a.server = proxy.NewPersistent(a.logger, a.dataDir)
 	a.running = false
 	a.patchedIDs = nil
 	a.modelAliases = nil
