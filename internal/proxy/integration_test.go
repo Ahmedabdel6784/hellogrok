@@ -1208,7 +1208,7 @@ func TestChatFacadeStreamsReasoningToolsAndSearchSources(t *testing.T) {
 	}
 
 	sourceCount := -1
-	if err := scanSSEPayloads(bytes.NewReader(data), func(payload []byte) error {
+	if err := scanSSEPayloads(bytes.NewReader(data), func(_ []string, payload []byte) error {
 		event, err := decodeJSONMap(payload)
 		if err != nil {
 			return err
@@ -1990,6 +1990,220 @@ func TestFacadeRejectsMalformedIntermediateSSEFrame(t *testing.T) {
 	}
 	if bytes.Contains(data, []byte("response.completed")) {
 		t.Fatalf("frames after malformed SSE data were forwarded: %s", data)
+	}
+}
+
+func TestFacadeNormalizesResponsesHeartbeatFrames(t *testing.T) {
+	var logs bytes.Buffer
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			"event: keepalive\n"+
+				`data: {"type":"keepalive","timestamp":123}`+"\n\n"+
+				"data: ping\n\n"+
+				"event: heartbeat\n"+
+				"data: {}\n\n"+
+				": upstream comment\n\n"+
+				`data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"m","output":[]}}`+"\n\n"+
+				`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"m","output":[]}}`+"\n\n")
+	}))
+	defer up.Close()
+
+	s := New(log.New(&logs, "", 0))
+	s.SetRoutes([]config.Route{facadeRoute("heartbeat-sse", "responses", "m", "key", up.URL)})
+	startPathTestServer(t, s)
+	data, status := postFacade(t, s, "heartbeat-sse", []byte(`{"input":"hi","stream":true}`), "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, data)
+	}
+	for _, forbidden := range [][]byte{
+		[]byte("event: keepalive"),
+		[]byte("event: heartbeat"),
+		[]byte(`"type":"keepalive"`),
+		[]byte("data: ping"),
+	} {
+		if bytes.Contains(data, forbidden) {
+			t.Fatalf("private heartbeat leaked to the Responses client (%q): %s", forbidden, data)
+		}
+	}
+	if got := bytes.Count(data, []byte(": keepalive\n\n")); got != 3 {
+		t.Fatalf("normalized heartbeat comments=%d, want 3: %s", got, data)
+	}
+	if !bytes.Contains(data, []byte("response.created")) || !bytes.Contains(data, []byte("response.completed")) {
+		t.Fatalf("valid Responses events were not preserved: %s", data)
+	}
+	if !bytes.Contains(data, []byte(`"sequence_number":0`)) || !bytes.Contains(data, []byte(`"sequence_number":1`)) {
+		t.Fatalf("heartbeats consumed Responses sequence numbers: %s", data)
+	}
+	if !strings.Contains(logs.String(), "heartbeats=3") {
+		t.Fatalf("heartbeat filtering was not observable in the log: %s", logs.String())
+	}
+}
+
+func TestFacadeStopsReadingAfterResponsesTerminalEvent(t *testing.T) {
+	for _, eventType := range []string{"response.completed", "response.incomplete", "response.failed"} {
+		t.Run(strings.TrimPrefix(eventType, "response."), func(t *testing.T) {
+			upstreamCanceled := make(chan struct{})
+			releaseUpstream := make(chan struct{})
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				status := strings.TrimPrefix(eventType, "response.")
+				_, _ = fmt.Fprintf(w, "data: {\"type\":%q,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":%q,\"model\":\"m\",\"output\":[]}}\n\n", eventType, status)
+				w.(http.Flusher).Flush()
+				select {
+				case <-r.Context().Done():
+					close(upstreamCanceled)
+				case <-releaseUpstream:
+				}
+			}))
+			defer func() {
+				close(releaseUpstream)
+				up.Close()
+			}()
+
+			s := New(log.New(io.Discard, "", 0))
+			s.SetRoutes([]config.Route{facadeRoute("terminal-sse", "responses", "m", "key", up.URL)})
+			startPathTestServer(t, s)
+			target := "http://" + s.PathAddr + "/c/terminal-sse/responses"
+			req, _ := http.NewRequest(http.MethodPost, target, strings.NewReader(`{"input":"hi","stream":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatalf("terminal Responses event did not end the downstream stream: %v", err)
+			}
+			if !bytes.Contains(data, []byte(eventType)) {
+				t.Fatalf("terminal event was not forwarded: %s", data)
+			}
+			select {
+			case <-upstreamCanceled:
+			case <-time.After(time.Second):
+				t.Fatal("upstream Responses body remained open after the terminal event")
+			}
+		})
+	}
+}
+
+func TestTranslatedFacadesStopReadingAfterTerminalEvent(t *testing.T) {
+	tests := []struct {
+		backend string
+		body    string
+	}{
+		{
+			backend: "messages",
+			body: `data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"model","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+				`data: {"type":"message_stop"}` + "\n\n",
+		},
+		{
+			backend: "chat_completions",
+			body: `data: {"id":"chat_1","object":"chat.completion.chunk","model":"model","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: [DONE]\n\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.backend, func(t *testing.T) {
+			upstreamCanceled := make(chan struct{})
+			releaseUpstream := make(chan struct{})
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.body)
+				w.(http.Flusher).Flush()
+				select {
+				case <-r.Context().Done():
+					close(upstreamCanceled)
+				case <-releaseUpstream:
+				}
+			}))
+			defer func() {
+				close(releaseUpstream)
+				up.Close()
+			}()
+
+			s := New(log.New(io.Discard, "", 0))
+			s.SetRoutes([]config.Route{facadeRoute("translated-terminal", test.backend, "model", "key", up.URL)})
+			startPathTestServer(t, s)
+			target := "http://" + s.PathAddr + "/c/translated-terminal/responses"
+			req, _ := http.NewRequest(http.MethodPost, target, strings.NewReader(`{"input":"hi","stream":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Fatalf("terminal %s event did not end the downstream stream: %v", test.backend, err)
+			}
+			if !bytes.Contains(data, []byte("response.completed")) {
+				t.Fatalf("%s terminal event was not converted: %s", test.backend, data)
+			}
+			select {
+			case <-upstreamCanceled:
+			case <-time.After(time.Second):
+				t.Fatalf("upstream %s body remained open after the terminal event", test.backend)
+			}
+		})
+	}
+}
+
+func TestTranslatedFacadesIgnorePrivateHeartbeatEvents(t *testing.T) {
+	tests := []struct {
+		backend string
+		body    string
+	}{
+		{
+			backend: "messages",
+			body: "event: keep-alive\n" +
+				`data: {}` + "\n\n" +
+				`data: {"type":"provider.notice","event":"response.heartbeat"}` + "\n\n" +
+				"data: ping\n\n" +
+				`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"model","usage":{"input_tokens":1,"output_tokens":0}}}` + "\n\n" +
+				`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+				`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}` + "\n\n" +
+				`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+				`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}` + "\n\n" +
+				`data: {"type":"message_stop"}` + "\n\n",
+		},
+		{
+			backend: "chat_completions",
+			body: "event: keep_alive\n" +
+				`data: {}` + "\n\n" +
+				`data: {"type":"provider.notice","event":"response.ping"}` + "\n\n" +
+				"data: heartbeat\n\n" +
+				`data: {"id":"chat_1","object":"chat.completion.chunk","model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}` + "\n\n" +
+				`data: {"id":"chat_1","object":"chat.completion.chunk","model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}` + "\n\n" +
+				"data: [DONE]\n\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.backend, func(t *testing.T) {
+			var logs bytes.Buffer
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer up.Close()
+			s := New(log.New(&logs, "", 0))
+			s.SetRoutes([]config.Route{facadeRoute("translated-heartbeat", test.backend, "model", "key", up.URL)})
+			startPathTestServer(t, s)
+			data, status := postFacade(t, s, "translated-heartbeat", []byte(`{"input":"hi","stream":true}`), "")
+			if status != http.StatusOK {
+				t.Fatalf("status=%d body=%s", status, data)
+			}
+			if bytes.Contains(data, []byte("provider.notice")) || !bytes.Contains(data, []byte("response.completed")) {
+				t.Fatalf("%s heartbeat was not safely absorbed: %s", test.backend, data)
+			}
+			if got := bytes.Count(data, []byte(": keepalive\n\n")); got != 3 {
+				t.Fatalf("%s normalized heartbeat comments=%d, want 3: %s", test.backend, got, data)
+			}
+			if !strings.Contains(logs.String(), "heartbeats=3") {
+				t.Fatalf("%s heartbeat filtering was not observable in the log: %s", test.backend, logs.String())
+			}
+		})
 	}
 }
 

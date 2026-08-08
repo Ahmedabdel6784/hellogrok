@@ -400,6 +400,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 	probed := false
 	evidence := newSearchEvidence()
 	clientWriteFailed := false
+	heartbeats := 0
 	type deferredFrame struct {
 		lines []string
 		event map[string]any
@@ -446,6 +447,14 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		events++
 		return writePayloadFrame(lines, string(payload))
 	}
+	writeHeartbeat := func() error {
+		if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+			clientWriteFailed = true
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
 	findOutputItem := func(response map[string]any, id string) map[string]any {
 		for _, raw := range anySlice(response["output"]) {
 			item, _ := raw.(map[string]any)
@@ -466,6 +475,10 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 		}
 		if trimmedPayload == "" || trimmedPayload == "[DONE]" {
 			return writePayloadFrame(lines, payload)
+		}
+		if isPrivateSSEHeartbeat(lines, payload) {
+			heartbeats++
+			return writeHeartbeat()
 		}
 
 		restored, err := restoreClientWebSearchAliasJSON([]byte(payload), request.ClientSearchAlias)
@@ -539,6 +552,9 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 			}
 			frame = frame[:0]
 			frameBytes = 0
+			if terminal != "" {
+				break
+			}
 			continue
 		}
 		if frameBytes+len(line)+1 > maxSSEEventBytes {
@@ -560,7 +576,7 @@ func (s *Server) streamResponsesSSE(w http.ResponseWriter, response *http.Respon
 			writeResponsesStreamError(w, flusher, events, "upstream Responses stream failed")
 		}
 	}
-	s.log.Printf("UP channel=%s SSE done events=%d terminal=%s %s", channel, events, terminal, time.Since(started).Round(time.Millisecond))
+	s.log.Printf("UP channel=%s SSE done events=%d heartbeats=%d terminal=%s %s", channel, events, heartbeats, terminal, time.Since(started).Round(time.Millisecond))
 	s.logSearchEvidence(channel, request, evidence)
 	if terminal == "" {
 		s.log.Printf("UP channel=%s SSE ended without a Responses terminal event", channel)

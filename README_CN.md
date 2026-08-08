@@ -6,7 +6,7 @@
 
 跨平台 Grok Build 本地代理，让自定义模型渠道兼容常见 API 格式、Build 原生 Web 工具、独立鉴权和自动配置恢复。
 
-[![Version](https://img.shields.io/badge/version-0.1.3-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.4-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#平台支持)
@@ -43,13 +43,14 @@ hellogrok 为这些自定义渠道提供统一的本地兼容层。运行时准�
 
 ## 功能
 
-[完整更新日志](./CHANGELOG.md)
+[发布说明](./RELEASE_NOTES_CN.md) | [完整更新日志](./CHANGELOG.md)
 
 ### 渠道兼容
 
 - 支持上游 `responses`、`chat_completions` 和 Anthropic 兼容 `messages` API。
 - 兼容历史单数写法 `message`；Grok Build 配置仍应优先使用官方复数写法 `messages`。
 - 逐帧透传 Responses SSE，并逐帧转换 Messages 与 Chat Completions SSE，包括推理、正文、函数参数、hosted 搜索活动和终止错误。
+- 在私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat`、`ping` 帧到达 Grok Build 前将其转换为标准 SSE 注释，不占用 Responses 事件序号；收到各协议的终止事件后立即关闭上游流。
 - 保留每个渠道配置的上游 URL 路径和模型标识。
 - 使用前准备所有显式自定义渠道，避免通过 `/model` 切换后首次请求失败。
 - 热切换模型时保留可移植的会话历史，只排除已知属于不同渠道、协议、线上模型或上游端点的加密推理。
@@ -344,6 +345,12 @@ Configured custom API channel
 对于 Grok Build 的流式请求，hellogrok 会向三类受支持后端都发送 `stream=true`。Responses SSE 逐帧透传，Messages 与 Chat Completions SSE 逐帧转换。如果日志出现 `ignored stream=true; emitting buffered JSON fallback`，说明该上游返回的是一次性完整 JSON，本次请求客观上无法实现真正流式。代理仍会生成协议兼容的 SSE，但会明确标记这是缓冲回退，而不是伪装成上游流式。
 
 当前 Grok Build 有两条来源路径：hosted 搜索读取 `web_search_call.action.sources`，客户端 `web_search` 工具读取 `output_text.annotations` 中的 URL 引用；两者显示的都是唯一域名数，不是原始链接条数。对于 `responses`、`messages` 和 `chat_completions` 渠道，hellogrok 都会把同一批已验证 URL 写入两种表示，优先使用结构化结果和引用；只有响应已独立证明确实执行搜索时，才会从最终回答恢复有效 HTTP(S) 链接。普通回答中的链接不会凭空创建搜索调用。若供应商在整个响应中都不返回任何真实 URL，可以显示搜索活动，但不能伪造可信的站点数量。
+
+### 出现 `unknown variant keepalive` 或持续 `Waiting for response...`
+
+请把两个 hellogrok 可执行文件都升级到 v0.1.4 或更高版本，然后重启代理。部分中转会向 Responses 流注入私有 `keepalive`、`keep-alive`、`keep_alive`、`heartbeat` 或 `ping` 事件；Grok Build 会用严格的 Responses 事件枚举反序列化每个数据帧，因此即使上游仍在生成，直接转发这些 JSON 对象也会触发序列化错误。hellogrok 现在会从 SSE `event:` 字段、JSON `type`/`event` 字段和裸数据载荷中吸收这些名称，再输出标准的 `: keepalive` 注释。收到 Responses 完成事件、Messages `message_stop` 或 Chat Completions `[DONE]` 后，也会立即关闭上游请求，不再等待服务商主动断开连接。
+
+流结束日志会包含 `heartbeats=<数量>`。若仍出现同一错误且该计数始终为零，请用 `hellogrok routes` 确认 Grok Build 确实经过当前代理；此时服务商很可能使用了其他私有事件名，应根据不含凭据的流抓取结果诊断，而不是添加模型专用绕过逻辑。
 
 ### Claude Messages 渠道选错模型或返回 404
 

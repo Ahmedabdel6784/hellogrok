@@ -1,43 +1,11 @@
-# 发布说明 — v0.1.3
+# 发布说明 — v0.1.4
 
-## 切换模型后会话保持连续
+## 私有心跳帧不再导致 Grok Build 失败
 
-在 Grok Build 中使用 `/model` 切换模型时，历史对话中可能带有前一模型产生的加密推理数据。如果新模型无法解密这些数据，就会反复拒绝请求并陷入重试。hellogrok 现在会自动清除来自不同渠道、协议或上游端点的加密推理记录，同时完整保留可见消息、工具调用、工具结果、搜索历史以及未加密的推理内容。
+部分兼容 Responses 的中转会在模型工作期间注入非标准 `keepalive`、`heartbeat` 或 `ping` JSON 事件。Grok Build 1.0.0 会用严格的 Responses 事件枚举解析每个数据帧，因此这些私有值会触发 `serialization error: unknown variant keepalive`，即使上游任务及其子代理仍在执行。
 
-推理来源的追踪信息以 SHA-256 摘要形式存放在有容量上限的私有索引中，不会泄露对话原文。同一来源的加密状态继续正常透传；旧会话中的未知状态首次也先放行，仅在收到结构化签名或解密拒绝后才执行一次清理重放，再次失败则标记为不可重试。
+hellogrok 现在会识别 SSE `event:` 字段、JSON `type`/`event` 字段和裸数据载荷中的常见拼写变体，并将其转换为标准的 `: keepalive` SSE 注释。这样既能保持连接活跃，又不会进入 Grok Build 的类型化事件流，也不会占用 Responses 事件序号。结束日志只记录心跳数量，不记录私有载荷。
 
-## 启动速度大幅提升，渠道路由更可靠
+## 已完成的流会立即关闭
 
-代理启动时不再逐个探测上游服务商的搜索能力。当 `supports_backend_search` 未设置或为 `false` 时直接走 Grok Build 客户端搜索路径，显式设为 `true` 时直接选择托管搜索，省去了启动探测请求。这一改动消除了此前 Grok、Claude、GPT 等渠道不可用或不兼容时常见的一到两分钟启动等待。搜索能力配置有误时，会在首次真实搜索请求时直接报错，而非在启动阶段反复重试。
-
-渠道标识中的点和连字符现在会完整保留，涵盖 ID、显示名称、上游模型名、URL 路径和渠道专属凭据。旧式模型表仅在代理运行期间规范化，停止时逐字节恢复。官方的 `messages` 后端和历史 `message` 别名统一走 Messages 转换。所有后端默认使用 Bearer 鉴权，需要 `X-Api-Key` 的服务商可设置 `auth_scheme = "x_api_key"`。
-
-## 全协议支持真流式输出
-
-Responses SSE 仍逐帧透传。Anthropic Messages 和 Chat Completions 请求现在保留 `stream=true`，其 SSE 增量会实时转换为 Grok Build Responses 事件，涵盖推理过程、回答正文、函数参数、托管搜索活动、用量统计、完成状态和错误终止。首个本地增量在上游响应完全返回之前即可发出。
-
-如果服务商忽略了 `stream=true` 并直接返回完整 JSON 响应，hellogrok 会通过缓冲 SSE 回退保持请求正常完成，并在日志中明确记录这次降级——完整响应到达后无法还原真实的逐 token 输出时序。
-
-## 跨渠道搜索来源数量统一展示
-
-Responses、Messages 和 Chat Completions 三种渠道的搜索证据统一规范为 `web_search_call.action.sources` 和 `output_text.annotations`。即使选择其他协议模型作为 Grok Build 的客户端搜索模型，也不影响这一行为，无需依赖 `supports_backend_search` 设置。因此 Grok Build 在托管搜索和客户端搜索两种模式下都能显示原生的去重站点数量。
-
-hellogrok 只输出来自结构化结果、引用、注解或经独立确认确实执行搜索的回答中的真实 HTTP(S) URL。普通回答中的链接不会触发搜索调用，服务商未提供 URL 证据时也不会虚构来源或数量。
-
-## 响应校验更精准，无效重试大幅减少
-
-上游的成功响应现在必须包含合法的 Responses、Messages 或 Chat Completions 结构。格式错误的 2xx 响应会返回明确的 502，不再伪装成正常结果进入 Grok Build 的重试循环。由配置、结构和转换引发的确定性错误会标记 `X-Should-Retry: false`，避免无意义的重试；真实传输故障和上游重试提示则保持原有语义。API 根地址配置错误时返回的 HTML 页面，会直接提示检查 `base_url` 或 `api_backend`，不暴露页面内容。
-
-客户端搜索的工具选择现在仅依据结构化 `tool_choice`，不再扫描提示词中的关键词。服务商专有搜索重放按渠道、前序对话和稳定搜索标识严格隔离，候选结果存在歧义时直接拒绝，不会混入不相关的搜索内容。
-
-## 已打开窗口的会话自动同步
-
-代理启用或停用后，hellogrok 会通过 ACP 连接当前 Grok Build 的共享 Leader，重新加载模型列表，并让空闲的自定义模型会话重新匹配当前模型。这意味着修改代理配置后无需重新打开窗口，会话中的 URL、后端、凭据和规范化模型 ID 都会自动刷新。正在使用中、等待输入、已被外部配置替换以及使用 `--no-leader` 的会话则保守处理，并明确提示何时需要在 `/model` 中手动重选。
-
-当前和旧版 ACP 模型切换方式均受支持。Windows 上 Grok Build 1.0.0 误报为过时的活跃命名管道 Leader，只有在其锁确实被占用时才会被接受。状态结构升级后，版本 5 的改写事务仍可恢复。
-
-## Windows：状态面板、日志与端口冲突处理
-
-状态面板现在按代理、渠道、Grok 会话、协议与搜索、配置恢复分类展示。日志跨代理会话追加写入，默认保留最近七个实际使用日，支持自定义保留周期和循环查找下一条匹配。状态文字自动换行，原始日志行保留横向滚动。
-
-端口 `127.0.0.1:18787` 被占用时（包括 WinSock 错误 10048），hellogrok 会在修改 Grok 配置之前检测到冲突。托盘异步操作失败会直接报错，不再让界面停留在不确定状态。
+三种受支持后端现在都以各自的协议终止事件作为本地流结束标志：Responses 在 `response.completed`、`response.incomplete` 或 `response.failed` 后停止；Messages 在 `message_stop` 后停止；Chat Completions 在 `[DONE]` 后停止。随后 hellogrok 会关闭上游响应体，从而取消那些已经完成却仍保持 HTTP 连接的中转请求，避免 Grok Build 长时间停在 `Waiting for response...`。

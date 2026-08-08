@@ -6,7 +6,7 @@
 
 A cross-platform local proxy that makes Grok Build custom model channels work with common API formats, native Web tools, isolated authentication, and automatic configuration recovery.
 
-[![Version](https://img.shields.io/badge/version-0.1.3-2f6feb.svg)](./internal/appinfo/appinfo.go)
+[![Version](https://img.shields.io/badge/version-0.1.4-2f6feb.svg)](./internal/appinfo/appinfo.go)
 [![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8.svg)](./go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -43,13 +43,14 @@ It is intended for users who maintain multiple third-party model channels and wa
 
 ## Features
 
-[Full Changelog](./CHANGELOG.md)
+[Release notes](./RELEASE_NOTES.md) | [Full Changelog](./CHANGELOG.md)
 
 ### Channel compatibility
 
 - Supports upstream `responses`, `chat_completions`, and Anthropic-compatible `messages` APIs.
 - Accepts legacy singular `message` as a hellogrok compatibility alias; Grok Build configuration should still use the official `messages` spelling.
 - Passes through Responses SSE and incrementally translates Messages and Chat Completions SSE, including reasoning, text, function arguments, hosted-search activity, and terminal errors.
+- Converts provider-private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, and `ping` frames into standard SSE comments before they reach Grok Build, without consuming Responses sequence numbers, and closes each upstream stream as soon as its protocol terminal event arrives.
 - Preserves each configured upstream URL path and model identifier.
 - Prepares every explicit custom channel before use, avoiding first-request failures after `/model` switching.
 - Preserves portable conversation history during model hot switching while withholding only encrypted reasoning known to belong to a different channel, protocol, wire model, or upstream endpoint.
@@ -344,6 +345,12 @@ Prefer `[model."full.ID"]` when a channel ID contains dots. TOML interprets an u
 For a streaming Grok Build request, hellogrok sends `stream=true` to every supported backend. Responses SSE is forwarded frame by frame; Messages and Chat Completions SSE is converted frame by frame. If the log says `ignored stream=true; emitting buffered JSON fallback`, that upstream returned one complete JSON response, so true streaming is impossible for that request. The fallback remains protocol-compatible but is intentionally reported as buffered rather than presented as upstream streaming.
 
 Current Grok Build has two source paths: hosted search reads `web_search_call.action.sources`, while its client `web_search` tool reads URL citations from `output_text.annotations`. Both render unique domains rather than raw URL count. For `responses`, `messages`, and `chat_completions` channels alike, hellogrok writes the same verified URLs to both forms, first using structured results and citations and, only when search execution is independently confirmed, recovering valid HTTP(S) links from the final answer. A normal answer link does not create a search call. If a provider returns no real URL anywhere, search activity can still be shown but a trustworthy site count cannot be fabricated.
+
+### `unknown variant keepalive` or an endless `Waiting for response...`
+
+Upgrade both hellogrok executables to v0.1.4 or later and restart the proxy. Some relays inject private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, or `ping` events into a Responses stream. Grok Build deserializes stream data as a strict Responses event enum, so forwarding those JSON objects produces a serialization error even though the upstream generation may still be running. hellogrok now absorbs these names from the SSE `event:` field, JSON `type` or `event`, and raw data payloads, then emits the standards-compatible `: keepalive` comment instead. A completed Responses event, Messages `message_stop`, or Chat Completions `[DONE]` also closes the upstream request immediately rather than waiting for the provider to close its socket.
+
+The completion log includes `heartbeats=<count>`. If the same error remains while that counter stays zero, confirm that Grok Build is routed through the current proxy with `hellogrok routes`; the provider is likely emitting a different private event name that should be diagnosed from a credential-free stream capture rather than added as a model-specific workaround.
 
 ### A Claude Messages channel selects the wrong model or returns 404
 

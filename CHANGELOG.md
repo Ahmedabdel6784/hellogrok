@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-08-08
+
+### Fixed
+
+- Provider-private `keepalive`, `keep-alive`, `keep_alive`, `heartbeat`, and `ping` SSE frames are normalized to standards-compatible comments before Grok Build's strict Responses event deserializer sees them. Detection covers SSE `event:` names, JSON `type` and `event` fields, raw data payloads, and their `response.*` forms without consuming sequence numbers.
+- Responses streams now stop reading after `response.completed`, `response.incomplete`, or `response.failed`; Messages and Chat Completions conversions stop after `message_stop` and `[DONE]`. Closing the response body cancels providers that leave an already completed stream socket open.
+- Heartbeat handling and terminal-driven closure now cover all three supported `api_backend` values, including relays that send heartbeats only through the SSE event name.
+
+### Changed
+
+- Stream completion logs include a heartbeat count without recording heartbeat payloads.
+
 ## [0.1.3] — 2026-08-08
 
 ### Added
@@ -85,7 +97,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CC Switch compatibility detection and conflict warnings.
 - Builds for Windows, Linux, and macOS on amd64 and arm64.
 
-[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/hellowind777/hellogrok/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/hellowind777/hellogrok/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/hellowind777/hellogrok/compare/v0.1.1...v0.1.3
 [0.1.1]: https://github.com/hellowind777/hellogrok/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/hellowind777/hellogrok/releases/tag/v0.1.0

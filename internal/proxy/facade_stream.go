@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,11 @@ import (
 	"time"
 
 	"github.com/hellowind777/hellogrok/internal/config"
+)
+
+var (
+	errSSEStreamComplete  = errors.New("SSE stream complete")
+	heartbeatNameReplacer = strings.NewReplacer("-", "", "_", "", ".", "")
 )
 
 type translatedStreamWriter struct {
@@ -50,6 +56,15 @@ func (w *translatedStreamWriter) emit(typ string, values map[string]any) error {
 	return nil
 }
 
+func (w *translatedStreamWriter) emitHeartbeat() error {
+	if _, err := io.WriteString(w.w, ": keepalive\n\n"); err != nil {
+		w.writeFailed = true
+		return err
+	}
+	w.flusher.Flush()
+	return nil
+}
+
 func (w *translatedStreamWriter) emitStart(route config.Route, request facadeRequest, responseID string, createdAt int64) error {
 	created := translatedResponse(route, request, canonicalResult{}, responseID, createdAt)
 	created["completed_at"] = nil
@@ -76,7 +91,7 @@ func translatedResponse(route config.Route, request facadeRequest, result canoni
 	return response
 }
 
-func scanSSEPayloads(reader io.Reader, consume func([]byte) error) error {
+func scanSSEPayloads(reader io.Reader, consume func([]string, []byte) error) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), maxSSEEventBytes)
 	frame := make([]string, 0, 4)
@@ -86,12 +101,13 @@ func scanSSEPayloads(reader io.Reader, consume func([]byte) error) error {
 			return nil
 		}
 		payload, ok := sseFramePayload(frame)
+		lines := append([]string(nil), frame...)
 		frame = frame[:0]
 		frameBytes = 0
 		if !ok {
 			return nil
 		}
-		return consume([]byte(payload))
+		return consume(lines, []byte(payload))
 	}
 	for scanner.Scan() {
 		line := strings.TrimSuffix(scanner.Text(), "\r")
@@ -111,6 +127,44 @@ func scanSSEPayloads(reader io.Reader, consume func([]byte) error) error {
 		return err
 	}
 	return flush()
+}
+
+func isPrivateSSEHeartbeat(lines []string, payload string) bool {
+	eventName := ""
+	for _, line := range lines {
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		}
+	}
+
+	trimmed := strings.TrimSpace(payload)
+	var value any
+	if json.Unmarshal([]byte(trimmed), &value) == nil {
+		switch typed := value.(type) {
+		case map[string]any:
+			for _, key := range []string{"type", "event"} {
+				if isHeartbeatName(stringValue(typed[key])) {
+					return true
+				}
+			}
+		case string:
+			return isHeartbeatName(typed)
+		}
+	}
+	if isHeartbeatName(trimmed) {
+		return true
+	}
+	return isHeartbeatName(eventName)
+}
+
+func isHeartbeatName(value string) bool {
+	normalized := heartbeatNameReplacer.Replace(strings.ToLower(strings.TrimSpace(value)))
+	switch normalized {
+	case "keepalive", "heartbeat", "ping", "responsekeepalive", "responseheartbeat", "responseping":
+		return true
+	default:
+		return false
+	}
 }
 
 type messagesStreamBlock struct {
@@ -618,16 +672,27 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 		return
 	}
 	evidence := newSearchEvidence()
-	streamErr := scanSSEPayloads(response.Body, func(payload []byte) error {
+	heartbeats := 0
+	streamErr := scanSSEPayloads(response.Body, func(lines []string, payload []byte) error {
+		if isPrivateSSEHeartbeat(lines, string(payload)) {
+			heartbeats++
+			return writer.emitHeartbeat()
+		}
 		if strings.TrimSpace(string(payload)) != "[DONE]" {
 			evidence.observeJSON(payload)
 		}
-		err := state.handle(payload)
-		if err == nil {
-			s.captureReasoningProvenance(route, state.output)
+		if err := state.handle(payload); err != nil {
+			return err
 		}
-		return err
+		s.captureReasoningProvenance(route, state.output)
+		if state.terminal {
+			return errSSEStreamComplete
+		}
+		return nil
 	})
+	if errors.Is(streamErr, errSSEStreamComplete) {
+		streamErr = nil
+	}
 	if streamErr != nil {
 		s.log.Printf("UP channel=%s Messages SSE conversion error: %v", route.ChannelID, streamErr)
 		writer.emitStreamError("upstream Messages stream failed")
@@ -638,7 +703,7 @@ func (s *Server) streamMessagesSSE(w http.ResponseWriter, response *http.Respons
 	if state.sawStart {
 		s.replays.captureMessages(route.ChannelID, request.ReplayScope, state.nativeResponse())
 	}
-	s.log.Printf("UP channel=%s Messages SSE done events=%d terminal=%t %s", route.ChannelID, writer.sequence, state.terminal, time.Since(started).Round(time.Millisecond))
+	s.log.Printf("UP channel=%s Messages SSE done events=%d heartbeats=%d terminal=%t %s", route.ChannelID, writer.sequence, heartbeats, state.terminal, time.Since(started).Round(time.Millisecond))
 	s.logSearchEvidence(route.ChannelID, request, evidence)
 }
 
@@ -977,16 +1042,27 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 		return
 	}
 	evidence := newSearchEvidence()
-	streamErr := scanSSEPayloads(response.Body, func(payload []byte) error {
+	heartbeats := 0
+	streamErr := scanSSEPayloads(response.Body, func(lines []string, payload []byte) error {
+		if isPrivateSSEHeartbeat(lines, string(payload)) {
+			heartbeats++
+			return writer.emitHeartbeat()
+		}
 		if strings.TrimSpace(string(payload)) != "[DONE]" {
 			evidence.observeJSON(payload)
 		}
-		err := state.handle(payload)
-		if err == nil {
-			s.captureReasoningProvenance(route, state.output)
+		if err := state.handle(payload); err != nil {
+			return err
 		}
-		return err
+		s.captureReasoningProvenance(route, state.output)
+		if state.terminal {
+			return errSSEStreamComplete
+		}
+		return nil
 	})
+	if errors.Is(streamErr, errSSEStreamComplete) {
+		streamErr = nil
+	}
 	if streamErr == nil && !state.terminal && state.finishReason != "" {
 		streamErr = state.finish()
 	}
@@ -997,7 +1073,7 @@ func (s *Server) streamChatSSE(w http.ResponseWriter, response *http.Response, r
 		s.log.Printf("UP channel=%s Chat Completions SSE ended without [DONE] or finish_reason", route.ChannelID)
 		writer.emitStreamError("upstream Chat Completions stream ended without a terminal chunk")
 	}
-	s.log.Printf("UP channel=%s Chat Completions SSE done events=%d terminal=%t %s", route.ChannelID, writer.sequence, state.terminal, time.Since(started).Round(time.Millisecond))
+	s.log.Printf("UP channel=%s Chat Completions SSE done events=%d heartbeats=%d terminal=%t %s", route.ChannelID, writer.sequence, heartbeats, state.terminal, time.Since(started).Round(time.Millisecond))
 	s.logSearchEvidence(route.ChannelID, request, evidence)
 }
 
